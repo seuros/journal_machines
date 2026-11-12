@@ -1,0 +1,71 @@
+module JournalMachines
+  VERSION: String
+  SEGMENT_CAPACITY: Integer
+  PIN_CAPACITY: Integer
+  type segment_state = :active | :sealed | :proposed | :durable | :reclaimable
+  type roll_refusal = :empty | :time_regression | :full | :overflow | :no_active
+  type roll_decision = :keep | :size | :records | :age | :time_regression | :overflow | :no_active
+  type pin_refusal = :full | :unassigned | :exhausted
+  type pin_update = :advanced | :unchanged | :reassigned | :stale | :regressed | :stale_assignment | :unassigned | :wrong_kind
+  type confirm_result = :confirmed | :already_durable | :invalid | :stale
+  class Pin
+    def kind: () -> (:reader | :checkpoint)
+  end
+  class Replacement
+    def segment: () -> Integer
+    def attempt: () -> Integer
+  end
+  class Segment < Data
+    attr_reader id: Integer
+    attr_reader revision: Integer
+    attr_reader base_offset: Integer
+    attr_reader records: Integer
+    attr_reader stored_records: Integer
+    attr_reader live_records: Integer
+    attr_reader bytes: Integer
+    attr_reader opened_at: Integer
+    attr_reader state: segment_state
+    attr_reader pinned: bool
+    attr_reader replacement: Replacement?
+    def end_offset: () -> Integer
+  end
+  class Rolled < Data
+    attr_reader sealed: Integer
+    attr_reader opened: Integer
+    attr_reader next_offset: Integer
+  end
+  class Reclaimed < Data
+    attr_reader segment: Integer
+    attr_reader revision: Integer
+    attr_reader bytes: Integer
+    attr_reader replaced_by: Integer?
+  end
+  class Journal
+    def self.new: (?base_offset: Integer, ?now: Integer, ?max_bytes: Integer?, ?max_records: Integer?, ?max_age: Integer?, ?min_dead_per_mille: Integer) -> Journal
+    def capacity: () -> Integer
+    def pin_capacity: () -> Integer
+    def size: () -> Integer
+    def roll_decision: (Integer bytes, Integer records, Integer now) -> roll_decision
+    def roll: (Integer bytes, Integer records, Integer now) -> (Rolled | roll_refusal)
+    def observe_live: (Integer id, Integer live_records) -> (:recorded | :unknown | :active | :exceeds)
+    def active: () -> Segment?
+    def segment: (Integer id) -> Segment?
+    def covering: (Integer offset) -> Segment?
+    def segments: (?Integer? after, ?Integer limit) -> Array[Segment]
+    def compaction_candidates: (?Integer? after, ?Integer limit) -> Array[Segment]
+    def reclaimable: (?Integer? after, ?Integer limit) -> Array[Segment]
+    def pin_reader: (Integer offset) -> (Pin | pin_refusal)
+    def pin_checkpoint: (Integer assignment, Integer offset) -> (Pin | pin_refusal)
+    def advance: (Pin, Integer offset) -> pin_update
+    def checkpoint: (Pin, Integer assignment, Integer offset) -> pin_update
+    def release: (Pin) -> (:released | :stale)
+    def pin_offset: (Pin) -> Integer?
+    def low_pin: () -> Integer?
+    def pins: () -> Integer
+    def propose: (Integer id) -> (Replacement | :unknown | :active | :busy | :exhausted)
+    def confirm_rewritten: (Replacement, Integer bytes, Integer live_records) -> confirm_result
+    def confirm_superseded: (Replacement) -> confirm_result
+    def reclaim: (Replacement) -> (Reclaimed | :stale | :not_durable | :pinned)
+    def abort: (Replacement) -> (:aborted | :stale)
+  end
+end
