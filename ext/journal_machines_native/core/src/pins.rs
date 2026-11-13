@@ -1,11 +1,10 @@
 //! Reader and checkpoint retention pins.
 use offset_machines::Tracker;
 
-use crate::Journal;
+use crate::{Journal, Refusal};
 
 /// What a pin stands for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum PinKind {
     /// A reader positioned at the pinned offset.
     Reader,
@@ -14,6 +13,9 @@ pub enum PinKind {
 }
 
 /// Handle to one pin acquisition. A released pin's handle is stale forever.
+///
+/// A pin means something only to the journal that issued it. It is a plain
+/// slot and generation, so a journal cannot tell a foreign pin from its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pin {
     pub(crate) slot: usize,
@@ -35,48 +37,25 @@ impl Pin {
     }
 }
 
-/// Refusal to acquire a pin.
+/// Honoured outcome of [`Journal::advance`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PinError {
-    /// Every pin slot is held.
-    Full,
-    /// The pin generation space is exhausted.
-    Exhausted,
-    /// Assignment generation zero is never a valid checkpoint source.
-    Unassigned,
+pub enum Advanced {
+    /// The reader pin moved forward.
+    Moved,
+    /// Idempotent repeat: the pin already sits at that offset. Nothing changed.
+    Unchanged,
 }
 
-/// Outcome of moving a pin.
+/// Honoured outcome of [`Journal::checkpoint`] and [`Journal::checkpoint_from`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PinUpdate {
-    /// The pin moved forward.
+pub enum Checkpointed {
+    /// The same assignment generation moved the pin forward.
     Advanced,
-    /// The pin already sits at that offset.
-    Unchanged,
     /// A newer assignment generation took over the checkpoint at its own offset.
     Reassigned,
-    /// The handle was released or never belonged to this slot.
-    Stale,
-    /// The offset is behind the pin; pins never move back within a generation.
-    Regressed,
-    /// The assignment generation is older than the one the checkpoint holds.
-    StaleAssignment,
-    /// Assignment generation zero is never a valid checkpoint source.
-    Unassigned,
-    /// A reader call on a checkpoint pin, or the reverse.
-    WrongKind,
-}
-
-/// Outcome of [`Journal::release`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Release {
-    /// The pin no longer retains anything.
-    Released,
-    /// The handle's generation does not match the slot; nothing was released.
-    Stale,
+    /// Idempotent repeat: the same assignment generation reported the offset
+    /// the pin already sits at. Nothing changed.
+    Unchanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,8 +70,9 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// Retain every offset at or after `offset` for a reader.
     ///
     /// # Errors
-    /// [`PinError::Full`] or [`PinError::Exhausted`]; nothing is pinned.
-    pub fn pin_reader(&mut self, offset: u64) -> Result<Pin, PinError> {
+    /// [`Refusal::PinsFull`] or [`Refusal::Exhausted`] (pin generations);
+    /// nothing is pinned.
+    pub fn pin_reader(&mut self, offset: u64) -> Result<Pin, Refusal> {
         self.acquire(PinKind::Reader, offset, 0)
     }
 
@@ -100,11 +80,11 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// the consumer assignment generation `assignment`.
     ///
     /// # Errors
-    /// [`PinError::Unassigned`] for generation zero, otherwise as
+    /// [`Refusal::Unassigned`] for generation zero, otherwise as
     /// [`Journal::pin_reader`].
-    pub fn pin_checkpoint(&mut self, assignment: u64, offset: u64) -> Result<Pin, PinError> {
+    pub fn pin_checkpoint(&mut self, assignment: u64, offset: u64) -> Result<Pin, Refusal> {
         if assignment == 0 {
-            return Err(PinError::Unassigned);
+            return Err(Refusal::Unassigned);
         }
         self.acquire(PinKind::Checkpoint, offset, assignment)
     }
@@ -117,81 +97,93 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     pub fn pin_checkpoint_from<const WORDS: usize>(
         &mut self,
         tracker: &Tracker<WORDS>,
-    ) -> Result<Pin, PinError> {
+    ) -> Result<Pin, Refusal> {
         self.pin_checkpoint(tracker.generation(), tracker.base())
     }
 
-    /// Move a reader pin forward.
-    #[must_use]
-    pub fn advance(&mut self, pin: Pin, offset: u64) -> PinUpdate {
-        let Some(held) = self.held_mut(pin) else {
-            return PinUpdate::Stale;
-        };
+    /// Move a reader pin forward. The offset the pin already sits at is an
+    /// idempotent repeat: [`Advanced::Unchanged`].
+    ///
+    /// # Errors
+    /// [`Refusal::Stale`], [`Refusal::WrongKind`] or [`Refusal::Regressed`];
+    /// the pin stays where it was.
+    pub fn advance(&mut self, pin: Pin, offset: u64) -> Result<Advanced, Refusal> {
+        let held = self.held_mut(pin).ok_or(Refusal::Stale)?;
         if held.kind != PinKind::Reader {
-            return PinUpdate::WrongKind;
+            return Err(Refusal::WrongKind);
         }
-        if offset < held.offset {
-            return PinUpdate::Regressed;
-        }
-        if offset == held.offset {
-            return PinUpdate::Unchanged;
+        if !forward(held.offset, offset)? {
+            return Ok(Advanced::Unchanged);
         }
         held.offset = offset;
-        PinUpdate::Advanced
+        Ok(Advanced::Moved)
     }
 
     /// Move a checkpoint pin to `offset` as confirmed under `assignment`.
     ///
     /// The same assignment generation only moves forward. A newer one takes
     /// over at whatever offset it reports, even a lower one; an older one is
-    /// refused, so a fenced consumer cannot loosen retention.
-    #[must_use]
-    pub fn checkpoint(&mut self, pin: Pin, assignment: u64, offset: u64) -> PinUpdate {
-        let Some(held) = self.held_mut(pin) else {
-            return PinUpdate::Stale;
-        };
+    /// refused, so a fenced consumer cannot loosen retention. The same
+    /// generation at the offset the pin already sits at is an idempotent
+    /// repeat: [`Checkpointed::Unchanged`].
+    ///
+    /// # Errors
+    /// [`Refusal::Stale`], [`Refusal::WrongKind`], [`Refusal::Unassigned`],
+    /// [`Refusal::StaleAssignment`] or [`Refusal::Regressed`]; the pin stays
+    /// where it was.
+    pub fn checkpoint(
+        &mut self,
+        pin: Pin,
+        assignment: u64,
+        offset: u64,
+    ) -> Result<Checkpointed, Refusal> {
+        let held = self.held_mut(pin).ok_or(Refusal::Stale)?;
         if held.kind != PinKind::Checkpoint {
-            return PinUpdate::WrongKind;
+            return Err(Refusal::WrongKind);
         }
         if assignment == 0 {
-            return PinUpdate::Unassigned;
+            return Err(Refusal::Unassigned);
         }
         if assignment < held.assignment {
-            return PinUpdate::StaleAssignment;
+            return Err(Refusal::StaleAssignment);
         }
         if assignment > held.assignment {
             held.assignment = assignment;
             held.offset = offset;
-            return PinUpdate::Reassigned;
+            return Ok(Checkpointed::Reassigned);
         }
-        if offset < held.offset {
-            return PinUpdate::Regressed;
-        }
-        if offset == held.offset {
-            return PinUpdate::Unchanged;
+        if !forward(held.offset, offset)? {
+            return Ok(Checkpointed::Unchanged);
         }
         held.offset = offset;
-        PinUpdate::Advanced
+        Ok(Checkpointed::Advanced)
     }
 
     /// Move a checkpoint pin to a tracker's confirmed-committed base.
-    #[must_use]
+    ///
+    /// # Errors
+    /// As [`Journal::checkpoint`]; an unassigned tracker is `Unassigned`.
     pub fn checkpoint_from<const WORDS: usize>(
         &mut self,
         pin: Pin,
         tracker: &Tracker<WORDS>,
-    ) -> PinUpdate {
+    ) -> Result<Checkpointed, Refusal> {
         self.checkpoint(pin, tracker.generation(), tracker.base())
     }
 
     /// Drop a pin. Only the handle of the current acquisition releases it.
-    #[must_use]
-    pub fn release(&mut self, pin: Pin) -> Release {
-        if self.held_mut(pin).is_none() {
-            return Release::Stale;
-        }
+    ///
+    /// A second release is not an honoured repeat. The journal keeps no
+    /// record of the pins it issued, so it cannot prove that a pin it does
+    /// not hold was ever its own: whoever holds the slot now keeps it.
+    ///
+    /// # Errors
+    /// [`Refusal::Stale`] for a pin that is not currently held; nothing was
+    /// released.
+    pub fn release(&mut self, pin: Pin) -> Result<(), Refusal> {
+        self.held_mut(pin).ok_or(Refusal::Stale)?;
         self.pins[pin.slot] = None;
-        Release::Released
+        Ok(())
     }
 
     /// Offset a live pin retains from; `None` for a stale handle.
@@ -217,16 +209,16 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
         self.pins.iter().flatten().count()
     }
 
-    fn acquire(&mut self, kind: PinKind, offset: u64, assignment: u64) -> Result<Pin, PinError> {
+    fn acquire(&mut self, kind: PinKind, offset: u64, assignment: u64) -> Result<Pin, Refusal> {
         let slot = self
             .pins
             .iter()
             .position(Option::is_none)
-            .ok_or(PinError::Full)?;
+            .ok_or(Refusal::PinsFull)?;
         let generation = self
             .pin_generations
             .checked_add(1)
-            .ok_or(PinError::Exhausted)?;
+            .ok_or(Refusal::Exhausted)?;
         self.pin_generations = generation;
         self.pins[slot] = Some(PinSlot {
             generation,
@@ -246,5 +238,15 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
             .get_mut(pin.slot)?
             .as_mut()
             .filter(|held| held.generation == pin.generation)
+    }
+}
+
+/// Whether moving a pin held at `held` to `offset` moves it forward; `false`
+/// when it already sits there.
+const fn forward(held: u64, offset: u64) -> Result<bool, Refusal> {
+    if offset < held {
+        Err(Refusal::Regressed)
+    } else {
+        Ok(offset > held)
     }
 }

@@ -2,22 +2,60 @@ module JournalMachines
   VERSION: String
   SEGMENT_CAPACITY: Integer
   PIN_CAPACITY: Integer
+  type roll_reason = :size | :records | :age
   type segment_state = :active | :sealed | :proposed | :durable | :reclaimable
-  type roll_refusal = :empty | :time_regression | :full | :overflow | :no_active
-  type roll_decision = :keep | :size | :records | :age | :time_regression | :overflow | :no_active
-  type pin_refusal = :full | :unassigned | :exhausted
-  type pin_update = :advanced | :unchanged | :reassigned | :stale | :regressed | :stale_assignment | :unassigned | :wrong_kind
-  type confirm_result = :confirmed | :already_durable | :invalid | :stale
+  # Integer nanoseconds on one monotonic clock, for instants and spans alike:
+  # Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond). A non-Integer
+  # raises TypeError; a value outside 0..2**64-1 raises RangeError.
+  type nanoseconds = Integer
+  # Every symbol that means "this call was not honoured and changed nothing".
+  # One per core `Refusal` variant, no catch-all. Each method below lists
+  # exactly the ones it can answer.
+  type refusal = :no_active | :empty | :time_regression | :overflow | :segments_full | :pins_full | :exhausted
+               | :unknown | :active | :busy | :exceeds | :mismatch | :stale | :wrong_kind | :unassigned
+               | :stale_assignment | :regressed | :not_durable | :pinned
+  # Honoured idempotent repeats the journal can prove: what was asked for
+  # already holds, nothing changed. :unchanged (advance, checkpoint,
+  # checkpoint_from) and :already_durable (confirm_rewritten,
+  # confirm_superseded, with the payload that was recorded) are answers, not
+  # refusals. Releasing a pin that is not held is not one: it is :stale.
+  type repeat = :unchanged | :already_durable
+  type roll_refusal = :no_active | :empty | :time_regression | :overflow | :segments_full | :exhausted
+  type roll_decision_refusal = :no_active | :time_regression | :overflow
+  type observe_refusal = :unknown | :active | :exceeds
+  type pin_reader_refusal = :pins_full | :exhausted
+  type pin_checkpoint_refusal = :unassigned | :pins_full | :exhausted
+  type advance_refusal = :stale | :wrong_kind | :regressed
+  type checkpoint_refusal = :stale | :wrong_kind | :unassigned | :stale_assignment | :regressed
+  type release_refusal = :stale
+  type propose_refusal = :unknown | :active | :busy | :exhausted
+  type confirm_rewritten_refusal = :stale | :mismatch | :exceeds
+  type confirm_superseded_refusal = :stale | :mismatch
+  type reclaim_refusal = :stale | :not_durable | :pinned
+  type abort_refusal = :stale
   interface _Tracker
     def generation: () -> Integer
     def base: () -> Integer
   end
+  # A Pin or a Replacement is only meaningful to the Journal that issued it;
+  # any other Journal answers :stale (nil from pin_offset).
   class Pin
     def kind: () -> (:reader | :checkpoint)
+    def generation: () -> Integer
   end
   class Replacement
     def segment: () -> Integer
     def attempt: () -> Integer
+  end
+  # The core's Policy: same fields, same order, no defaults. A zero threshold
+  # or a ratio above 1000 raises RangeError; a non-Integer raises TypeError.
+  class Policy < Data
+    attr_reader max_bytes: Integer?
+    attr_reader max_records: Integer?
+    attr_reader max_age: nanoseconds?
+    attr_reader min_dead_per_mille: Integer
+    def self.new: (Integer? max_bytes, Integer? max_records, nanoseconds? max_age, Integer min_dead_per_mille) -> Policy
+                | (max_bytes: Integer?, max_records: Integer?, max_age: nanoseconds?, min_dead_per_mille: Integer) -> Policy
   end
   class Segment < Data
     attr_reader id: Integer
@@ -27,11 +65,17 @@ module JournalMachines
     attr_reader stored_records: Integer
     attr_reader live_records: Integer
     attr_reader bytes: Integer
-    attr_reader opened_at: Integer
+    attr_reader opened_at: nanoseconds
     attr_reader state: segment_state
     attr_reader pinned: bool
     attr_reader replacement: Replacement?
     def end_offset: () -> Integer
+  end
+  # The core's Roll::Due(reason); Roll::Keep is the symbol :keep.
+  class Due < Data
+    attr_reader reason: roll_reason
+    def self.new: (roll_reason reason) -> Due
+                | (reason: roll_reason) -> Due
   end
   class Rolled < Data
     attr_reader sealed: Integer
@@ -45,37 +89,46 @@ module JournalMachines
     attr_reader replaced_by: Integer?
   end
   class Journal
-    def self.new: (?base_offset: Integer, ?now: Integer, ?max_bytes: Integer?, ?max_records: Integer?, ?max_age: Integer?, ?min_dead_per_mille: Integer) -> Journal
-    def capacity: () -> Integer
+    def self.new: (Policy policy, Integer base_offset, nanoseconds now) -> Journal
+    def policy: () -> Policy
+    def segment_capacity: () -> Integer
     def pin_capacity: () -> Integer
     def size: () -> Integer
-    def roll_decision: (Integer bytes, Integer records, Integer now) -> roll_decision
-    def roll: (Integer bytes, Integer records, Integer now) -> (Rolled | roll_refusal)
-    def observe_live: (Integer id, Integer live_records) -> (:recorded | :unknown | :active | :exceeds)
+    def empty?: () -> bool
+    def roll_decision: (Integer bytes, Integer records, nanoseconds now) -> (:keep | Due | roll_decision_refusal)
+    def roll: (Integer bytes, Integer records, nanoseconds now) -> (Rolled | roll_refusal)
+    def observe_live: (Integer id, Integer live_records) -> (:recorded | observe_refusal)
     def active: () -> Segment?
     def segment: (Integer id) -> Segment?
     def covering: (Integer offset) -> Segment?
-    def segments: (?Integer? after, ?Integer limit) -> Array[Segment]
-    def compaction_candidates: (?Integer? after, ?Integer limit) -> Array[Segment]
-    def reclaimable: (?Integer? after, ?Integer limit) -> Array[Segment]
-    def pin_reader: (Integer offset) -> (Pin | pin_refusal)
-    def pin_checkpoint: (Integer assignment, Integer offset) -> (Pin | pin_refusal)
-    def pin_checkpoint_from: (_Tracker tracker) -> (Pin | pin_refusal)
-    def advance: (Pin, Integer offset) -> pin_update
-    def checkpoint: (Pin, Integer assignment, Integer offset) -> pin_update
-    def checkpoint_from: (Pin, _Tracker tracker) -> pin_update
-    def release: (Pin) -> (:released | :stale)
+    def segments: (Integer? after, Integer limit) -> Array[Segment]
+    def compaction_candidates: (Integer? after, Integer limit) -> Array[Segment]
+    def reclaimable: (Integer? after, Integer limit) -> Array[Segment]
+    def pin_reader: (Integer offset) -> (Pin | pin_reader_refusal)
+    def pin_checkpoint: (Integer assignment, Integer offset) -> (Pin | pin_checkpoint_refusal)
+    def pin_checkpoint_from: (_Tracker tracker) -> (Pin | pin_checkpoint_refusal)
+    def advance: (Pin, Integer offset) -> (:moved | :unchanged | advance_refusal)
+    def checkpoint: (Pin, Integer assignment, Integer offset) -> (:advanced | :reassigned | :unchanged | checkpoint_refusal)
+    def checkpoint_from: (Pin, _Tracker tracker) -> (:advanced | :reassigned | :unchanged | checkpoint_refusal)
+    # :stale for a pin that is not held, a second release included.
+    def release: (Pin) -> (:released | release_refusal)
     def pin_offset: (Pin) -> Integer?
     def low_pin: () -> Integer?
     def pins: () -> Integer
-    def propose: (Integer id) -> (Replacement | :unknown | :active | :busy | :exhausted)
-    def confirm_rewritten: (Replacement, Integer bytes, Integer live_records) -> confirm_result
-    def confirm_superseded: (Replacement) -> confirm_result
-    def reclaim: (Replacement) -> (Reclaimed | :stale | :not_durable | :pinned)
-    def abort: (Replacement) -> (:aborted | :stale)
+    def propose: (Integer id) -> (Replacement | propose_refusal)
+    # The core's confirm_durable(replacement, durable), one method per variant
+    # of its `Durable` argument: Rewritten { bytes, live_records } and Superseded.
+    # On an attempt that is already durable: :already_durable for the payload
+    # that was recorded, :mismatch for any other (the other method, or
+    # different bytes or live_records).
+    def confirm_rewritten: (Replacement, Integer bytes, Integer live_records) -> (:recorded | :already_durable | confirm_rewritten_refusal)
+    def confirm_superseded: (Replacement) -> (:recorded | :already_durable | confirm_superseded_refusal)
+    def reclaim: (Replacement) -> (Reclaimed | reclaim_refusal)
+    def abort: (Replacement) -> (:aborted | abort_refusal)
 
     private
 
+    REASONS: Array[roll_reason]
     def wrap: (Array[untyped]? row) -> Segment?
     def checkpoint_source: (_Tracker tracker) -> [Integer, Integer]
   end

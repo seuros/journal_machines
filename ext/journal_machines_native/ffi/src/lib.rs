@@ -2,13 +2,13 @@
 mod convert;
 mod init;
 
-use convert::{Number, roll_error, threshold, update};
+use convert::{Number, answer, nanos, policy, refusal};
 
-use std::{cell::RefCell, sync::Arc};
+use std::{cell::RefCell, num::NonZeroU64, sync::Arc};
 
 use journal_machines::{
-    Abort, Confirm, Durable, Observe, Pin, PinError, PinKind, PinUpdate, Policy, ProposeError,
-    ReclaimError, Release, Replacement, Roll, RollReason, Segment, SegmentId, SegmentState,
+    Advanced, Checkpointed, Confirmed, Durable, Pin, PinKind, Refusal, Replacement, Roll,
+    RollReason, Segment, SegmentId, SegmentState,
 };
 use magnus::{Error, IntoValue, RArray, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
 
@@ -25,8 +25,12 @@ impl PinHandle {
     fn kind(ruby: &Ruby, this: &Self) -> Symbol {
         ruby.to_symbol(match this.pin.kind() {
             PinKind::Reader => "reader",
-            _ => "checkpoint",
+            PinKind::Checkpoint => "checkpoint",
         })
+    }
+
+    const fn generation(&self) -> u64 {
+        self.pin.generation()
     }
 }
 
@@ -62,28 +66,45 @@ impl Journal {
         max_age: Option<Number>,
         min_dead_per_mille: Number,
     ) -> Result<Self, Error> {
-        let (max_bytes, max_records, max_age) = (
-            threshold(ruby, max_bytes)?,
-            threshold(ruby, max_records)?,
-            threshold(ruby, max_age)?,
-        );
-        let policy = u16::try_from(min_dead_per_mille.0)
-            .ok()
-            .and_then(|per_mille| Policy::new(max_bytes, max_records, max_age, per_mille))
-            .ok_or_else(|| {
-                Error::new(
-                    ruby.exception_range_error(),
-                    "min_dead_per_mille must be within 0..=1000",
-                )
-            })?;
+        let policy = policy(ruby, max_bytes, max_records, max_age, min_dead_per_mille)?;
         Ok(Self {
             owner: Arc::new(()),
-            core: RefCell::new(journal_machines::Journal::new(policy, base_offset.0, now.0)),
+            core: RefCell::new(journal_machines::Journal::new(
+                policy,
+                base_offset.0,
+                now.nanos(),
+            )),
         })
+    }
+
+    /// Raises where `Policy::new` answers `None`; `Policy.new` calls it.
+    fn check_policy(
+        ruby: &Ruby,
+        max_bytes: Option<Number>,
+        max_records: Option<Number>,
+        max_age: Option<Number>,
+        min_dead_per_mille: Number,
+    ) -> Result<(), Error> {
+        policy(ruby, max_bytes, max_records, max_age, min_dead_per_mille).map(|_| ())
+    }
+
+    /// The four `Policy` fields, in order.
+    fn policy(&self) -> (Option<u64>, Option<u64>, Option<u64>, u16) {
+        let policy = self.core.borrow().policy();
+        (
+            policy.max_bytes().map(NonZeroU64::get),
+            policy.max_records().map(NonZeroU64::get),
+            policy.max_age().map(nanos),
+            policy.min_dead_per_mille(),
+        )
     }
 
     fn size(&self) -> usize {
         self.core.borrow().len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.core.borrow().is_empty()
     }
 
     fn roll_decision(
@@ -93,13 +114,16 @@ impl Journal {
         records: Number,
         now: Number,
     ) -> Symbol {
-        let decision = this.core.borrow().roll_decision(bytes.0, records.0, now.0);
+        let decision = this
+            .core
+            .borrow()
+            .roll_decision(bytes.0, records.0, now.nanos());
         ruby.to_symbol(match decision {
             Ok(Roll::Due(RollReason::Size)) => "size",
             Ok(Roll::Due(RollReason::Records)) => "records",
-            Ok(Roll::Due(_)) => "age",
-            Ok(_) => "keep",
-            Err(error) => roll_error(error),
+            Ok(Roll::Due(RollReason::Age)) => "age",
+            Ok(Roll::Keep) => "keep",
+            Err(error) => refusal(error),
         })
     }
 
@@ -111,12 +135,12 @@ impl Journal {
         now: Number,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let rolled = this.core.borrow_mut().roll(bytes.0, records.0, now.0);
+        let rolled = this.core.borrow_mut().roll(bytes.0, records.0, now.nanos());
         Ok(match rolled {
             Ok(rolled) => {
                 (rolled.sealed.raw(), rolled.opened.raw(), rolled.next_offset).into_value_with(ruby)
             }
-            Err(error) => ruby.to_symbol(roll_error(error)).as_value(),
+            Err(error) => ruby.to_symbol(refusal(error)).as_value(),
         })
     }
 
@@ -131,12 +155,7 @@ impl Journal {
             .core
             .borrow_mut()
             .observe_live(SegmentId::from_raw(id.0), live.0);
-        Ok(ruby.to_symbol(match outcome {
-            Observe::Recorded => "recorded",
-            Observe::Active => "active",
-            Observe::Exceeds => "exceeds",
-            _ => "unknown",
-        }))
+        Ok(answer(ruby, outcome, "recorded"))
     }
 
     fn row(&self, ruby: &Ruby, segment: Segment) -> Result<RArray, Error> {
@@ -148,13 +167,13 @@ impl Journal {
         row.push(segment.stored_records)?;
         row.push(segment.live_records)?;
         row.push(segment.bytes)?;
-        row.push(segment.opened_at)?;
+        row.push(nanos(segment.opened_at))?;
         row.push(ruby.to_symbol(match segment.state {
             SegmentState::Active => "active",
             SegmentState::Sealed => "sealed",
             SegmentState::Proposed => "proposed",
             SegmentState::Durable => "durable",
-            _ => "reclaimable",
+            SegmentState::Reclaimable => "reclaimable",
         }))?;
         row.push(segment.pinned)?;
         row.push(segment.replacement.map(|replacement| ReplacementHandle {
@@ -184,6 +203,7 @@ impl Journal {
     }
 
     /// At most `limit` rows (clamped to the capacity) after segment `after`.
+    /// `which` is one of the three private selectors the Ruby side passes.
     fn scan(
         ruby: &Ruby,
         this: &Self,
@@ -197,7 +217,8 @@ impl Journal {
         let segments = match which.name()?.as_ref() {
             "all" => core.segments(after),
             "candidates" => core.compaction_candidates(after),
-            _ => core.reclaimable(after),
+            "reclaimable" => core.reclaimable(after),
+            _ => return Err(Error::new(ruby.exception_arg_error(), "unknown scan")),
         };
         let rows = ruby.ary_new_capa(take);
         for segment in segments.take(take) {
@@ -206,16 +227,14 @@ impl Journal {
         Ok(rows)
     }
 
-    fn pinned(ruby: &Ruby, this: Obj<Self>, pin: Result<Pin, PinError>) -> Value {
+    fn pinned(ruby: &Ruby, this: Obj<Self>, pin: Result<Pin, Refusal>) -> Value {
         match pin {
             Ok(pin) => PinHandle {
                 owner: Arc::clone(&this.owner),
                 pin,
             }
             .into_value_with(ruby),
-            Err(PinError::Full) => ruby.to_symbol("full").as_value(),
-            Err(PinError::Unassigned) => ruby.to_symbol("unassigned").as_value(),
-            Err(_) => ruby.to_symbol("exhausted").as_value(),
+            Err(error) => ruby.to_symbol(refusal(error)).as_value(),
         }
     }
 
@@ -239,8 +258,11 @@ impl Journal {
         Ok(Self::pinned(ruby, this, pin))
     }
 
-    fn own_pin(&self, handle: &PinHandle) -> Option<Pin> {
-        Arc::ptr_eq(&self.owner, &handle.owner).then_some(handle.pin)
+    /// A handle issued by another journal is stale here.
+    fn own_pin(&self, handle: &PinHandle) -> Result<Pin, Refusal> {
+        Arc::ptr_eq(&self.owner, &handle.owner)
+            .then_some(handle.pin)
+            .ok_or(Refusal::Stale)
     }
 
     fn advance(
@@ -250,10 +272,14 @@ impl Journal {
         offset: Number,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let outcome = this.own_pin(&handle).map_or(PinUpdate::Stale, |pin| {
-            this.core.borrow_mut().advance(pin, offset.0)
-        });
-        Ok(ruby.to_symbol(update(outcome)))
+        let outcome = this
+            .own_pin(&handle)
+            .and_then(|pin| this.core.borrow_mut().advance(pin, offset.0));
+        Ok(ruby.to_symbol(match outcome {
+            Ok(Advanced::Unchanged) => "unchanged",
+            Ok(Advanced::Moved) => "moved",
+            Err(error) => refusal(error),
+        }))
     }
 
     fn checkpoint(
@@ -264,27 +290,30 @@ impl Journal {
         offset: Number,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let outcome = this.own_pin(&handle).map_or(PinUpdate::Stale, |pin| {
+        let outcome = this.own_pin(&handle).and_then(|pin| {
             this.core
                 .borrow_mut()
                 .checkpoint(pin, assignment.0, offset.0)
         });
-        Ok(ruby.to_symbol(update(outcome)))
+        Ok(ruby.to_symbol(match outcome {
+            Ok(Checkpointed::Reassigned) => "reassigned",
+            Ok(Checkpointed::Unchanged) => "unchanged",
+            Ok(Checkpointed::Advanced) => "advanced",
+            Err(error) => refusal(error),
+        }))
     }
 
     fn release(ruby: &Ruby, this: Obj<Self>, handle: Obj<PinHandle>) -> Result<Symbol, Error> {
         this.check_frozen()?;
         let outcome = this
             .own_pin(&handle)
-            .map_or(Release::Stale, |pin| this.core.borrow_mut().release(pin));
-        Ok(ruby.to_symbol(match outcome {
-            Release::Released => "released",
-            _ => "stale",
-        }))
+            .and_then(|pin| this.core.borrow_mut().release(pin));
+        Ok(answer(ruby, outcome, "released"))
     }
 
     fn pin_offset(&self, handle: Obj<PinHandle>) -> Option<u64> {
         self.own_pin(&handle)
+            .ok()
             .and_then(|pin| self.core.borrow().pin_offset(pin))
     }
 
@@ -305,15 +334,15 @@ impl Journal {
                 replacement,
             }
             .into_value_with(ruby),
-            Err(ProposeError::Unknown) => ruby.to_symbol("unknown").as_value(),
-            Err(ProposeError::Active) => ruby.to_symbol("active").as_value(),
-            Err(ProposeError::Busy) => ruby.to_symbol("busy").as_value(),
-            Err(_) => ruby.to_symbol("exhausted").as_value(),
+            Err(error) => ruby.to_symbol(refusal(error)).as_value(),
         })
     }
 
-    fn own_replacement(&self, handle: &ReplacementHandle) -> Option<Replacement> {
-        Arc::ptr_eq(&self.owner, &handle.owner).then_some(handle.replacement)
+    /// A handle issued by another journal is stale here.
+    fn own_replacement(&self, handle: &ReplacementHandle) -> Result<Replacement, Refusal> {
+        Arc::ptr_eq(&self.owner, &handle.owner)
+            .then_some(handle.replacement)
+            .ok_or(Refusal::Stale)
     }
 
     fn confirm(
@@ -325,14 +354,11 @@ impl Journal {
         this.check_frozen()?;
         let outcome = this
             .own_replacement(&handle)
-            .map_or(Confirm::Stale, |replacement| {
-                this.core.borrow_mut().confirm_durable(replacement, durable)
-            });
+            .and_then(|replacement| this.core.borrow_mut().confirm_durable(replacement, durable));
         Ok(ruby.to_symbol(match outcome {
-            Confirm::Confirmed => "confirmed",
-            Confirm::AlreadyDurable => "already_durable",
-            Confirm::Invalid => "invalid",
-            _ => "stale",
+            Ok(Confirmed::AlreadyDurable) => "already_durable",
+            Ok(Confirmed::Recorded) => "recorded",
+            Err(error) => refusal(error),
         }))
     }
 
@@ -366,9 +392,7 @@ impl Journal {
         this.check_frozen()?;
         let outcome = this
             .own_replacement(&handle)
-            .map_or(Err(ReclaimError::Stale), |replacement| {
-                this.core.borrow_mut().reclaim(replacement)
-            });
+            .and_then(|replacement| this.core.borrow_mut().reclaim(replacement));
         Ok(match outcome {
             Ok(reclaimed) => (
                 reclaimed.segment.raw(),
@@ -377,9 +401,7 @@ impl Journal {
                 reclaimed.replaced_by,
             )
                 .into_value_with(ruby),
-            Err(ReclaimError::NotDurable) => ruby.to_symbol("not_durable").as_value(),
-            Err(ReclaimError::Pinned { .. }) => ruby.to_symbol("pinned").as_value(),
-            Err(_) => ruby.to_symbol("stale").as_value(),
+            Err(error) => ruby.to_symbol(refusal(error)).as_value(),
         })
     }
 
@@ -391,12 +413,7 @@ impl Journal {
         this.check_frozen()?;
         let outcome = this
             .own_replacement(&handle)
-            .map_or(Abort::Stale, |replacement| {
-                this.core.borrow_mut().abort(replacement)
-            });
-        Ok(ruby.to_symbol(match outcome {
-            Abort::Aborted => "aborted",
-            _ => "stale",
-        }))
+            .and_then(|replacement| this.core.borrow_mut().abort(replacement));
+        Ok(answer(ruby, outcome, "aborted"))
     }
 }

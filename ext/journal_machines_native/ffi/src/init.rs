@@ -10,6 +10,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let pin = module.define_class("Pin", ruby.class_object())?;
     pin.undef_default_alloc_func();
     pin.define_method("kind", method!(PinHandle::kind, 0))?;
+    pin.define_method("generation", method!(PinHandle::generation, 0))?;
     let replacement = module.define_class("Replacement", ruby.class_object())?;
     replacement.undef_default_alloc_func();
     replacement.define_method("segment", method!(ReplacementHandle::segment, 0))?;
@@ -17,8 +18,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let class = module.define_class("Journal", ruby.class_object())?;
     class.undef_default_alloc_func();
     class.define_singleton_method("__open", function!(Journal::open, 6))?;
+    class.define_singleton_method("__check_policy", function!(Journal::check_policy, 4))?;
+    class.define_method("__policy", method!(Journal::policy, 0))?;
     class.define_method("size", method!(Journal::size, 0))?;
-    class.define_method("roll_decision", method!(Journal::roll_decision, 3))?;
+    class.define_method("empty?", method!(Journal::is_empty, 0))?;
+    class.define_method("__roll_decision", method!(Journal::roll_decision, 3))?;
     class.define_method("__roll", method!(Journal::roll, 3))?;
     class.define_method("observe_live", method!(Journal::observe_live, 2))?;
     class.define_method("__active", method!(Journal::active, 0))?;

@@ -1,9 +1,8 @@
 //! Roll and compaction thresholds.
-use core::num::NonZeroU64;
+use core::{num::NonZeroU64, time::Duration};
 
 /// Why the active segment is due to roll. Checked in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum RollReason {
     /// The observed byte size reached `max_bytes`.
     Size,
@@ -19,22 +18,23 @@ pub enum RollReason {
 pub struct Policy {
     max_bytes: Option<NonZeroU64>,
     max_records: Option<NonZeroU64>,
-    max_age: Option<NonZeroU64>,
+    max_age: Option<Duration>,
     min_dead_per_mille: u16,
 }
 
 impl Policy {
-    /// Build a policy; `None` when `min_dead_per_mille` exceeds 1000.
+    /// Build a policy; `None` when `min_dead_per_mille` exceeds 1000 or
+    /// `max_age` is a zero span (disable a threshold with `None`, not zero).
     ///
-    /// Ages are in the caller's time unit, the same one passed as `now`.
+    /// `max_age` is a span of the same monotonic clock that supplies `now`.
     #[must_use]
     pub const fn new(
         max_bytes: Option<NonZeroU64>,
         max_records: Option<NonZeroU64>,
-        max_age: Option<NonZeroU64>,
+        max_age: Option<Duration>,
         min_dead_per_mille: u16,
     ) -> Option<Self> {
-        if min_dead_per_mille > 1000 {
+        if min_dead_per_mille > 1000 || matches!(max_age, Some(age) if age.is_zero()) {
             return None;
         }
         Some(Self {
@@ -59,7 +59,7 @@ impl Policy {
 
     /// Age at which a non-empty active segment is due.
     #[must_use]
-    pub const fn max_age(&self) -> Option<NonZeroU64> {
+    pub const fn max_age(&self) -> Option<Duration> {
         self.max_age
     }
 
@@ -69,13 +69,13 @@ impl Policy {
         self.min_dead_per_mille
     }
 
-    pub(crate) fn due(&self, bytes: u64, records: u64, age: u64) -> Option<RollReason> {
+    pub(crate) fn due(&self, bytes: u64, records: u64, age: Duration) -> Option<RollReason> {
         let reached = |limit: Option<NonZeroU64>, seen: u64| limit.is_some_and(|l| seen >= l.get());
         if reached(self.max_bytes, bytes) {
             Some(RollReason::Size)
         } else if reached(self.max_records, records) {
             Some(RollReason::Records)
-        } else if reached(self.max_age, age) {
+        } else if self.max_age.is_some_and(|limit| age >= limit) {
             Some(RollReason::Age)
         } else {
             None

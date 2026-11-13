@@ -3,11 +3,15 @@
 
 mod pins;
 mod policy;
+mod refusal;
 mod replace;
 
-pub use pins::{Pin, PinError, PinKind, PinUpdate, Release};
+pub use pins::{Advanced, Checkpointed, Pin, PinKind};
 pub use policy::{Policy, RollReason};
-pub use replace::{Abort, Confirm, Durable, ProposeError, ReclaimError, Reclaimed, Replacement};
+pub use refusal::Refusal;
+pub use replace::{Confirmed, Durable, Reclaimed, Replacement};
+
+use core::time::Duration;
 
 use pins::PinSlot;
 
@@ -31,7 +35,6 @@ impl SegmentId {
 
 /// Where a segment stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum SegmentState {
     /// The tail segment still being written.
     Active,
@@ -62,8 +65,8 @@ pub struct Segment {
     pub live_records: u64,
     /// Byte size of the current revision; zero while active.
     pub bytes: u64,
-    /// Caller time at which the segment was opened.
-    pub opened_at: u64,
+    /// When the segment was opened, on the caller's monotonic clock.
+    pub opened_at: Duration,
     /// Lifecycle state.
     pub state: SegmentState,
     /// Whether any pin retains part of the range; always false while active.
@@ -82,28 +85,11 @@ impl Segment {
 
 /// Answer of [`Journal::roll_decision`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Roll {
     /// Keep writing to the active segment.
     Keep,
     /// A threshold was reached.
     Due(RollReason),
-}
-
-/// Refusal to decide on or record a roll.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum RollError {
-    /// The journal has no active segment (zero segment capacity).
-    NoActive,
-    /// An empty segment cannot be sealed.
-    Empty,
-    /// `now` is earlier than the active segment's opening time.
-    TimeRegression,
-    /// Every segment slot is taken; reclaim before rolling.
-    Full,
-    /// The offset range or the identity space would overflow.
-    Overflow,
 }
 
 /// A recorded roll.
@@ -115,20 +101,6 @@ pub struct Rolled {
     pub opened: SegmentId,
     /// First offset of the new active segment.
     pub next_offset: u64,
-}
-
-/// Outcome of [`Journal::observe_live`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Observe {
-    /// The live count was recorded.
-    Recorded,
-    /// No such segment.
-    Unknown,
-    /// The active segment has no live count yet.
-    Active,
-    /// More live records than the segment stores.
-    Exceeds,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,12 +120,12 @@ pub(crate) struct Slot {
     pub(crate) stored: u64,
     pub(crate) live: u64,
     pub(crate) bytes: u64,
-    pub(crate) opened_at: u64,
+    pub(crate) opened_at: Duration,
     pub(crate) phase: Phase,
 }
 
 impl Slot {
-    const fn active(id: u64, base: u64, opened_at: u64) -> Self {
+    const fn active(id: u64, base: u64, opened_at: Duration) -> Self {
         Self {
             id,
             revision: 0,
@@ -195,9 +167,10 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// Pin slots, readers and checkpoints together.
     pub const PIN_CAPACITY: usize = PINS;
 
-    /// Start with one active segment at `base_offset`, opened at `now`.
+    /// Start with one active segment at `base_offset`, opened at `now`:
+    /// monotonic time since an epoch the caller picks.
     #[must_use]
-    pub const fn new(policy: Policy, base_offset: u64, now: u64) -> Self {
+    pub const fn new(policy: Policy, base_offset: u64, now: Duration) -> Self {
         let mut slots = [None; SEGMENTS];
         let len = if let Some(first) = slots.first_mut() {
             *first = Some(Slot::active(1, base_offset, now));
@@ -282,22 +255,19 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     }
 
     /// Decide whether the active segment should roll, from its observed
-    /// byte size and record count and the caller's clock. Reads only.
+    /// byte size and record count and the caller's monotonic clock. Reads only.
     ///
     /// An empty segment is never due, whatever its age.
     ///
     /// # Errors
-    /// [`RollError::NoActive`], [`RollError::TimeRegression`] or
-    /// [`RollError::Overflow`] when the observation cannot be true.
-    pub fn roll_decision(&self, bytes: u64, records: u64, now: u64) -> Result<Roll, RollError> {
-        let active = self.active_slot().ok_or(RollError::NoActive)?;
+    /// [`Refusal::NoActive`], [`Refusal::TimeRegression`] or
+    /// [`Refusal::Overflow`] when the observation cannot be true.
+    pub fn roll_decision(&self, bytes: u64, records: u64, now: Duration) -> Result<Roll, Refusal> {
+        let active = self.active_slot().ok_or(Refusal::NoActive)?;
         let age = now
             .checked_sub(active.opened_at)
-            .ok_or(RollError::TimeRegression)?;
-        active
-            .base
-            .checked_add(records)
-            .ok_or(RollError::Overflow)?;
+            .ok_or(Refusal::TimeRegression)?;
+        active.base.checked_add(records).ok_or(Refusal::Overflow)?;
         if records == 0 {
             return Ok(Roll::Keep);
         }
@@ -311,23 +281,22 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// `records` and opened a new one at `now`. A roll need not be due.
     ///
     /// # Errors
-    /// See [`RollError`]; a refusal changes nothing.
-    pub fn roll(&mut self, bytes: u64, records: u64, now: u64) -> Result<Rolled, RollError> {
-        let mut sealed = self.active_slot().ok_or(RollError::NoActive)?;
+    /// [`Refusal::NoActive`], [`Refusal::Empty`], [`Refusal::TimeRegression`],
+    /// [`Refusal::Overflow`], [`Refusal::SegmentsFull`] or
+    /// [`Refusal::Exhausted`] (segment ids); a refusal changes nothing.
+    pub fn roll(&mut self, bytes: u64, records: u64, now: Duration) -> Result<Rolled, Refusal> {
+        let mut sealed = self.active_slot().ok_or(Refusal::NoActive)?;
         if records == 0 {
-            return Err(RollError::Empty);
+            return Err(Refusal::Empty);
         }
         if now < sealed.opened_at {
-            return Err(RollError::TimeRegression);
+            return Err(Refusal::TimeRegression);
         }
-        let next_offset = sealed
-            .base
-            .checked_add(records)
-            .ok_or(RollError::Overflow)?;
+        let next_offset = sealed.base.checked_add(records).ok_or(Refusal::Overflow)?;
         if self.len == SEGMENTS {
-            return Err(RollError::Full);
+            return Err(Refusal::SegmentsFull);
         }
-        let opened = self.issued.checked_add(1).ok_or(RollError::Overflow)?;
+        let opened = self.issued.checked_add(1).ok_or(Refusal::Exhausted)?;
         sealed.span = records;
         sealed.stored = records;
         sealed.live = records;
@@ -345,22 +314,23 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     }
 
     /// Record how many of a sealed segment's stored records are still live.
-    #[must_use]
-    pub fn observe_live(&mut self, id: SegmentId, live_records: u64) -> Observe {
-        let Some(slot) = self
+    ///
+    /// # Errors
+    /// [`Refusal::Unknown`], [`Refusal::Active`] or [`Refusal::Exceeds`];
+    /// a refusal changes nothing.
+    pub fn observe_live(&mut self, id: SegmentId, live_records: u64) -> Result<(), Refusal> {
+        let slot = self
             .index_of(id)
             .and_then(|index| self.slots[index].as_mut())
-        else {
-            return Observe::Unknown;
-        };
+            .ok_or(Refusal::Unknown)?;
         if slot.phase == Phase::Active {
-            return Observe::Active;
+            return Err(Refusal::Active);
         }
         if live_records > slot.stored {
-            return Observe::Exceeds;
+            return Err(Refusal::Exceeds);
         }
         slot.live = live_records;
-        Observe::Recorded
+        Ok(())
     }
 
     pub(crate) fn index_of(&self, id: SegmentId) -> Option<usize> {

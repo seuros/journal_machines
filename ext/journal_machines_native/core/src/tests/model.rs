@@ -1,6 +1,7 @@
 //! A naive, growable model of the journal, written without sharing its code.
 use std::vec::Vec;
 
+use super::at;
 use crate::*;
 
 pub const SEGMENTS: usize = 5;
@@ -24,6 +25,7 @@ pub struct ModelSegment {
 
 #[derive(Debug, Clone)]
 pub struct ModelPin {
+    pub slot: usize,
     pub generation: u64,
     pub reader: bool,
     pub offset: u64,
@@ -82,7 +84,7 @@ impl Model {
             stored_records: segment.stored,
             live_records: segment.live,
             bytes: segment.bytes,
-            opened_at: segment.opened,
+            opened_at: at(segment.opened),
             state,
             pinned,
             replacement: segment.attempt.map(|attempt| Replacement {
@@ -106,10 +108,10 @@ impl Model {
             && dead * 1000 >= view.stored_records * self.per_mille
     }
 
-    pub fn roll_decision(&self, bytes: u64, records: u64, now: u64) -> Result<Roll, RollError> {
+    pub fn roll_decision(&self, bytes: u64, records: u64, now: u64) -> Result<Roll, Refusal> {
         let active = self.segments.last().expect("active");
         if now < active.opened {
-            return Err(RollError::TimeRegression);
+            return Err(Refusal::TimeRegression);
         }
         if records == 0 {
             return Ok(Roll::Keep);
@@ -124,17 +126,17 @@ impl Model {
         Ok(Roll::Keep)
     }
 
-    pub fn roll(&mut self, bytes: u64, records: u64, now: u64) -> Result<Rolled, RollError> {
+    pub fn roll(&mut self, bytes: u64, records: u64, now: u64) -> Result<Rolled, Refusal> {
         let full = self.segments.len() == SEGMENTS;
         let active = self.segments.last_mut().expect("active");
         if records == 0 {
-            return Err(RollError::Empty);
+            return Err(Refusal::Empty);
         }
         if now < active.opened {
-            return Err(RollError::TimeRegression);
+            return Err(Refusal::TimeRegression);
         }
         if full {
-            return Err(RollError::Full);
+            return Err(Refusal::SegmentsFull);
         }
         active.span = records;
         active.stored = records;
@@ -155,27 +157,31 @@ impl Model {
         self.segments.iter_mut().find(|segment| segment.id == id)
     }
 
-    pub fn observe_live(&mut self, id: u64, live: u64) -> Observe {
+    pub fn observe_live(&mut self, id: u64, live: u64) -> Result<(), Refusal> {
         match self.find(id) {
-            None => Observe::Unknown,
-            Some(segment) if !segment.sealed => Observe::Active,
-            Some(segment) if live > segment.stored => Observe::Exceeds,
+            None => Err(Refusal::Unknown),
+            Some(segment) if !segment.sealed => Err(Refusal::Active),
+            Some(segment) if live > segment.stored => Err(Refusal::Exceeds),
             Some(segment) => {
                 segment.live = live;
-                Observe::Recorded
+                Ok(())
             }
         }
     }
 
-    pub fn pin(&mut self, reader: bool, assignment: u64, offset: u64) -> Result<u64, PinError> {
+    pub fn pin(&mut self, reader: bool, assignment: u64, offset: u64) -> Result<u64, Refusal> {
         if !reader && assignment == 0 {
-            return Err(PinError::Unassigned);
+            return Err(Refusal::Unassigned);
         }
         if self.pins.len() == PINS {
-            return Err(PinError::Full);
+            return Err(Refusal::PinsFull);
         }
+        let slot = (0..PINS)
+            .find(|slot| self.pins.iter().all(|pin| pin.slot != *slot))
+            .expect("a free slot");
         self.generations += 1;
         self.pins.push(ModelPin {
+            slot,
             generation: self.generations,
             reader,
             offset,
@@ -184,64 +190,63 @@ impl Model {
         Ok(self.generations)
     }
 
+    /// The pin a handle names. A handle is a slot and a generation and
+    /// nothing else: one forged or issued by another journal that names a
+    /// held pin is that pin, and any other is held by nobody.
+    pub fn held(&mut self, handle: Pin) -> Option<&mut ModelPin> {
+        self.pins
+            .iter_mut()
+            .find(|pin| pin.slot == handle.slot && pin.generation == handle.generation)
+    }
+
     pub fn move_pin(
         &mut self,
-        generation: u64,
+        handle: Pin,
         reader: bool,
         assignment: u64,
         to: u64,
-    ) -> PinUpdate {
-        let Some(pin) = self
-            .pins
-            .iter_mut()
-            .find(|pin| pin.generation == generation)
-        else {
-            return PinUpdate::Stale;
-        };
+    ) -> Result<Checkpointed, Refusal> {
+        let pin = self.held(handle).ok_or(Refusal::Stale)?;
         if pin.reader != reader {
-            return PinUpdate::WrongKind;
+            return Err(Refusal::WrongKind);
         }
         if !reader {
             if assignment == 0 {
-                return PinUpdate::Unassigned;
+                return Err(Refusal::Unassigned);
             }
             if assignment < pin.assignment {
-                return PinUpdate::StaleAssignment;
+                return Err(Refusal::StaleAssignment);
             }
             if assignment > pin.assignment {
                 pin.assignment = assignment;
                 pin.offset = to;
-                return PinUpdate::Reassigned;
+                return Ok(Checkpointed::Reassigned);
             }
         }
         match to.cmp(&pin.offset) {
-            core::cmp::Ordering::Less => PinUpdate::Regressed,
-            core::cmp::Ordering::Equal => PinUpdate::Unchanged,
+            core::cmp::Ordering::Less => Err(Refusal::Regressed),
+            core::cmp::Ordering::Equal => Ok(Checkpointed::Unchanged),
             core::cmp::Ordering::Greater => {
                 pin.offset = to;
-                PinUpdate::Advanced
+                Ok(Checkpointed::Advanced)
             }
         }
     }
 
-    pub fn release(&mut self, generation: u64) -> Release {
-        let before = self.pins.len();
+    pub fn release(&mut self, handle: Pin) -> Result<(), Refusal> {
+        let generation = self.held(handle).ok_or(Refusal::Stale)?.generation;
         self.pins.retain(|pin| pin.generation != generation);
-        if self.pins.len() == before {
-            Release::Stale
-        } else {
-            Release::Released
-        }
+        Ok(())
     }
 
-    pub fn propose(&mut self, id: u64) -> Result<u64, ProposeError> {
+    pub fn propose(&mut self, id: u64) -> Result<u64, Refusal> {
         let attempt = self.attempts + 1;
-        let segment = self.find(id).ok_or(ProposeError::Unknown)?;
+        let segment = self.find(id).ok_or(Refusal::Unknown)?;
         if !segment.sealed {
-            return Err(ProposeError::Active);
+            return Err(Refusal::Active);
         }
         if segment.attempt.is_some() {
-            return Err(ProposeError::Busy);
+            return Err(Refusal::Busy);
         }
         segment.attempt = Some(attempt);
         self.attempts = attempt;
@@ -253,37 +258,35 @@ impl Model {
             .filter(|segment| segment.attempt == Some(handle.attempt))
     }
 
-    pub fn confirm(&mut self, handle: Replacement, durable: Durable) -> Confirm {
-        let Some(segment) = self.current(handle) else {
-            return Confirm::Stale;
-        };
-        if segment.durable.is_some() {
-            return Confirm::AlreadyDurable;
+    pub fn confirm(&mut self, handle: Replacement, durable: Durable) -> Result<Confirmed, Refusal> {
+        let segment = self.current(handle).ok_or(Refusal::Stale)?;
+        match segment.durable {
+            Some(recorded) if recorded == durable => return Ok(Confirmed::AlreadyDurable),
+            Some(_) => return Err(Refusal::Mismatch),
+            None => {}
         }
         if let Durable::Rewritten { live_records, .. } = durable
             && live_records > segment.stored
         {
-            return Confirm::Invalid;
+            return Err(Refusal::Exceeds);
         }
         segment.durable = Some(durable);
-        Confirm::Confirmed
+        Ok(Confirmed::Recorded)
     }
 
-    pub fn abort(&mut self, handle: Replacement) -> Abort {
-        let Some(segment) = self.current(handle) else {
-            return Abort::Stale;
-        };
+    pub fn abort(&mut self, handle: Replacement) -> Result<(), Refusal> {
+        let segment = self.current(handle).ok_or(Refusal::Stale)?;
         segment.attempt = None;
         segment.durable = None;
-        Abort::Aborted
+        Ok(())
     }
 
-    pub fn reclaim(&mut self, handle: Replacement) -> Result<Reclaimed, ReclaimError> {
+    pub fn reclaim(&mut self, handle: Replacement) -> Result<Reclaimed, Refusal> {
         let lowest = self.pins.iter().map(|pin| pin.offset).min();
-        let segment = self.current(handle).ok_or(ReclaimError::Stale)?;
-        let durable = segment.durable.ok_or(ReclaimError::NotDurable)?;
+        let segment = self.current(handle).ok_or(Refusal::Stale)?;
+        let durable = segment.durable.ok_or(Refusal::NotDurable)?;
         if let Some(offset) = lowest.filter(|offset| *offset < segment.base + segment.span) {
-            return Err(ReclaimError::Pinned { offset });
+            return Err(Refusal::Pinned { offset });
         }
         let mut reclaimed = Reclaimed {
             segment: handle.segment,

@@ -1,7 +1,11 @@
 //! Replacement lifecycle: proposed, durable-confirmed, reclaimed.
-use crate::{Journal, Phase, SegmentId};
+use crate::{Journal, Phase, Refusal, SegmentId};
 
 /// Handle to one replacement attempt for one sealed segment.
+///
+/// A handle means something only to the journal that issued it. It is a
+/// plain segment id and attempt number, so a journal cannot tell a foreign
+/// handle from its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Replacement {
     pub(crate) segment: SegmentId,
@@ -22,23 +26,8 @@ impl Replacement {
     }
 }
 
-/// Refusal to open a replacement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ProposeError {
-    /// No such segment.
-    Unknown,
-    /// The active segment is still being written.
-    Active,
-    /// The segment already has a replacement in flight.
-    Busy,
-    /// The attempt space is exhausted.
-    Exhausted,
-}
-
 /// What the caller made durable in place of the original segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Durable {
     /// A compacted copy of the same offset range holding only live records.
     Rewritten {
@@ -52,33 +41,14 @@ pub enum Durable {
     Superseded,
 }
 
-/// Outcome of [`Journal::confirm_durable`].
+/// Honoured outcome of [`Journal::confirm_durable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Confirm {
-    /// The replacement is recorded as durable.
-    Confirmed,
-    /// The handle is not the segment's current attempt.
-    Stale,
-    /// This attempt was already confirmed; the first confirmation stands.
+pub enum Confirmed {
+    /// The confirmation was recorded; the replacement is now durable.
+    Recorded,
+    /// Idempotent repeat: this attempt was confirmed before with exactly
+    /// this [`Durable`]. Nothing changed.
     AlreadyDurable,
-    /// A rewrite cannot hold more records than the original stored.
-    Invalid,
-}
-
-/// Refusal to reclaim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ReclaimError {
-    /// The handle is not the segment's current attempt.
-    Stale,
-    /// The replacement has not been confirmed durable.
-    NotDurable,
-    /// A pin still retains part of the segment.
-    Pinned {
-        /// Lowest pinned offset across all pins.
-        offset: u64,
-    },
 }
 
 /// Permission to delete one original segment file.
@@ -94,33 +64,21 @@ pub struct Reclaimed {
     pub replaced_by: Option<u64>,
 }
 
-/// Outcome of [`Journal::abort`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Abort {
-    /// The segment is sealed again; discard the replacement, keep the original.
-    Aborted,
-    /// The handle is not the segment's current attempt.
-    Stale,
-}
-
 impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// Open a replacement attempt for a sealed segment.
     ///
     /// # Errors
-    /// See [`ProposeError`]; a refusal changes nothing.
-    pub fn propose(&mut self, id: SegmentId) -> Result<Replacement, ProposeError> {
-        let index = self.index_of(id).ok_or(ProposeError::Unknown)?;
-        let slot = self.slots[index].as_mut().ok_or(ProposeError::Unknown)?;
+    /// [`Refusal::Unknown`], [`Refusal::Active`], [`Refusal::Busy`] or
+    /// [`Refusal::Exhausted`] (attempts); a refusal changes nothing.
+    pub fn propose(&mut self, id: SegmentId) -> Result<Replacement, Refusal> {
+        let index = self.index_of(id).ok_or(Refusal::Unknown)?;
+        let slot = self.slots[index].as_mut().ok_or(Refusal::Unknown)?;
         match slot.phase {
-            Phase::Active => return Err(ProposeError::Active),
-            Phase::Proposed(_) | Phase::Durable(..) => return Err(ProposeError::Busy),
+            Phase::Active => return Err(Refusal::Active),
+            Phase::Proposed(_) | Phase::Durable(..) => return Err(Refusal::Busy),
             Phase::Sealed => {}
         }
-        let attempt = self
-            .attempts
-            .checked_add(1)
-            .ok_or(ProposeError::Exhausted)?;
+        let attempt = self.attempts.checked_add(1).ok_or(Refusal::Exhausted)?;
         self.attempts = attempt;
         slot.phase = Phase::Proposed(attempt);
         Ok(Replacement {
@@ -131,51 +89,71 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
 
     /// Record the caller's confirmation that the replacement is durable.
     /// The journal cannot verify durability; it only refuses to reclaim without it.
-    #[must_use]
-    pub fn confirm_durable(&mut self, replacement: Replacement, durable: Durable) -> Confirm {
-        let Some(slot) = self
+    ///
+    /// Confirming an attempt that is already durable with the `durable` it
+    /// was confirmed with is an idempotent repeat,
+    /// [`Confirmed::AlreadyDurable`]. Any other `durable` was never recorded
+    /// and is refused: the first confirmation stands.
+    ///
+    /// # Errors
+    /// [`Refusal::Stale`], [`Refusal::Mismatch`] for an attempt already
+    /// durable with a different `durable`, or, for a rewrite holding more
+    /// records than the original stored, [`Refusal::Exceeds`]; a refusal
+    /// changes nothing.
+    pub fn confirm_durable(
+        &mut self,
+        replacement: Replacement,
+        durable: Durable,
+    ) -> Result<Confirmed, Refusal> {
+        let slot = self
             .index_of(replacement.segment)
             .and_then(|index| self.slots[index].as_mut())
-        else {
-            return Confirm::Stale;
-        };
+            .ok_or(Refusal::Stale)?;
         match slot.phase {
             Phase::Proposed(attempt) if attempt == replacement.attempt => {}
-            Phase::Durable(attempt, _) if attempt == replacement.attempt => {
-                return Confirm::AlreadyDurable;
+            Phase::Durable(attempt, recorded) if attempt == replacement.attempt => {
+                return if recorded == durable {
+                    Ok(Confirmed::AlreadyDurable)
+                } else {
+                    Err(Refusal::Mismatch)
+                };
             }
-            _ => return Confirm::Stale,
+            Phase::Active | Phase::Sealed | Phase::Proposed(_) | Phase::Durable(..) => {
+                return Err(Refusal::Stale);
+            }
         }
-        if let Durable::Rewritten { live_records, .. } = durable
-            && live_records > slot.stored
-        {
-            return Confirm::Invalid;
+        match durable {
+            Durable::Rewritten { live_records, .. } if live_records > slot.stored => {
+                return Err(Refusal::Exceeds);
+            }
+            Durable::Rewritten { .. } | Durable::Superseded => {}
         }
         slot.phase = Phase::Durable(replacement.attempt, durable);
-        Confirm::Confirmed
+        Ok(Confirmed::Recorded)
     }
 
     /// Release the original once its replacement is durable and no pin
     /// retains any of its offsets. Delete the original only after `Ok`.
     ///
     /// # Errors
-    /// See [`ReclaimError`]; a refusal changes nothing.
-    pub fn reclaim(&mut self, replacement: Replacement) -> Result<Reclaimed, ReclaimError> {
-        let index = self
-            .index_of(replacement.segment)
-            .ok_or(ReclaimError::Stale)?;
-        let slot = self.slots[index].ok_or(ReclaimError::Stale)?;
+    /// [`Refusal::Stale`], [`Refusal::NotDurable`] or [`Refusal::Pinned`];
+    /// a refusal changes nothing.
+    pub fn reclaim(&mut self, replacement: Replacement) -> Result<Reclaimed, Refusal> {
+        let index = self.index_of(replacement.segment).ok_or(Refusal::Stale)?;
+        let slot = self.slots[index].ok_or(Refusal::Stale)?;
         let durable = match slot.phase {
             Phase::Durable(attempt, durable) if attempt == replacement.attempt => durable,
             Phase::Proposed(attempt) if attempt == replacement.attempt => {
-                return Err(ReclaimError::NotDurable);
+                return Err(Refusal::NotDurable);
             }
-            _ => return Err(ReclaimError::Stale),
+            Phase::Active | Phase::Sealed | Phase::Proposed(_) | Phase::Durable(..) => {
+                return Err(Refusal::Stale);
+            }
         };
         if let Some(offset) = self.low_pin()
             && offset < slot.end()
         {
-            return Err(ReclaimError::Pinned { offset });
+            return Err(Refusal::Pinned { offset });
         }
         let mut reclaimed = Reclaimed {
             segment: replacement.segment,
@@ -183,44 +161,48 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
             bytes: slot.bytes,
             replaced_by: None,
         };
-        if let Durable::Rewritten {
-            bytes,
-            live_records,
-        } = durable
-        {
-            let mut rewritten = slot;
-            rewritten.revision = replacement.attempt;
-            rewritten.bytes = bytes;
-            rewritten.stored = live_records;
-            rewritten.live = slot.live.min(live_records);
-            rewritten.phase = Phase::Sealed;
-            self.slots[index] = Some(rewritten);
-            reclaimed.replaced_by = Some(replacement.attempt);
-        } else {
-            self.slots.copy_within(index + 1..self.len, index);
-            self.len -= 1;
-            self.slots[self.len] = None;
+        match durable {
+            Durable::Rewritten {
+                bytes,
+                live_records,
+            } => {
+                let mut rewritten = slot;
+                rewritten.revision = replacement.attempt;
+                rewritten.bytes = bytes;
+                rewritten.stored = live_records;
+                rewritten.live = slot.live.min(live_records);
+                rewritten.phase = Phase::Sealed;
+                self.slots[index] = Some(rewritten);
+                reclaimed.replaced_by = Some(replacement.attempt);
+            }
+            Durable::Superseded => {
+                self.slots.copy_within(index + 1..self.len, index);
+                self.len -= 1;
+                self.slots[self.len] = None;
+            }
         }
         Ok(reclaimed)
     }
 
     /// Abandon a proposed or durable replacement; the original stays.
-    #[must_use]
-    pub fn abort(&mut self, replacement: Replacement) -> Abort {
-        let Some(slot) = self
+    ///
+    /// # Errors
+    /// [`Refusal::Stale`]; nothing was abandoned.
+    pub fn abort(&mut self, replacement: Replacement) -> Result<(), Refusal> {
+        let slot = self
             .index_of(replacement.segment)
             .and_then(|index| self.slots[index].as_mut())
-        else {
-            return Abort::Stale;
-        };
+            .ok_or(Refusal::Stale)?;
         match slot.phase {
             Phase::Proposed(attempt) | Phase::Durable(attempt, _)
                 if attempt == replacement.attempt =>
             {
                 slot.phase = Phase::Sealed;
-                Abort::Aborted
+                Ok(())
             }
-            _ => Abort::Stale,
+            Phase::Active | Phase::Sealed | Phase::Proposed(_) | Phase::Durable(..) => {
+                Err(Refusal::Stale)
+            }
         }
     }
 }
