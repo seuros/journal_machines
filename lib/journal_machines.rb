@@ -40,11 +40,24 @@ module JournalMachines
     # One active segment at `base_offset`, opened at `now`: Integer nanoseconds
     # of a monotonic clock (Process.clock_gettime(Process::CLOCK_MONOTONIC,
     # :nanosecond)). Every later `now` passed to #roll_decision and #roll is
-    # read on the same clock.
-    def self.new(policy, base_offset, now)
+    # read on the same clock. The journal is in scope zero.
+    def self.new(policy, base_offset, now) = with_scope(policy, base_offset, now, 0)
+
+    # As Journal.new, with every segment id, pin generation and attempt number
+    # the journal issues carrying `scope`: an Integer in 0..65_535. A journal
+    # of another scope answers :stale to its pins and replacements and
+    # :unknown to its segment ids. Give each journal its own scope.
+    def self.with_scope(policy, base_offset, now, scope) = resumed(policy, base_offset, now, scope, 0)
+
+    # As Journal.with_scope after a restart: the journal continues the one
+    # sequence its ids, generations and attempts are drawn from after
+    # `issued`, the #issued saved from the journal before it, so nothing that
+    # journal handed out is issued again. Segments and pins are not restored.
+    # RangeError when `issued` leaves no number for the active segment.
+    def self.resumed(policy, base_offset, now, scope, issued)
       raise TypeError, 'expected a JournalMachines::Policy' unless policy.is_a?(Policy)
 
-      __open(base_offset, now, *policy.deconstruct)
+      __open(base_offset, now, [scope, issued], policy.deconstruct)
     end
 
     def policy = Policy.new(*__policy)

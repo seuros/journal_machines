@@ -6,17 +6,19 @@ require_relative 'test_helper'
 class RefusalsTest < Minitest::Test
   include JournalHelpers
 
-  # Regression: a pin the journal does not hold is :stale. It keeps no record
-  # of the pins it issued, so it cannot prove a second release is a repeat.
+  # A second release is not a provable repeat: nothing remembers a released
+  # pin, and the journal's one sequence numbers segments and attempts too.
   def test_releasing_a_pin_that_is_not_held_is_stale
-    a = open_journal
-    b = open_journal
+    a = open_journal(scope: 1)
+    b = open_journal(scope: 2)
     p = a.pin_checkpoint(1, 0)
     q = b.pin_reader(0)
     assert_equal :released, b.release(q)
     assert_equal :stale, b.release(p)
     assert_equal :stale, b.release(q)
     assert_equal [0, 1, 0], [b.pins, a.pins, a.pin_offset(p)]
+    # A journal that has issued no pin never issued this one either.
+    assert_equal :stale, open_journal(scope: 2).release(q)
   end
 
   # Regression: a repeat is a repeat only with the payload that was recorded.
@@ -30,7 +32,7 @@ class RefusalsTest < Minitest::Test
     assert_equal :mismatch, journal.confirm_rewritten(handle, 50, 4)
     assert_equal :mismatch, journal.confirm_rewritten(handle, 50, 11)
     assert_equal :already_durable, journal.confirm_rewritten(handle, 50, 5)
-    assert_equal 1, journal.reclaim(handle).replaced_by
+    assert_equal 3, journal.reclaim(handle).replaced_by
     assert_equal [50, 5], journal.segment(1).to_h.values_at(:bytes, :stored_records)
 
     journal.roll(100, 10, 0)
@@ -106,27 +108,15 @@ class RefusalsTest < Minitest::Test
     end
   end
 
-  def test_handles_belong_to_one_journal
-    a, = journal_with(1)
-    b, = journal_with(1)
-    pin = a.pin_reader(0)
-    replacement = a.propose(1)
-    b.pin_reader(0)
-    b.propose(1)
-    assert_equal :stale, b.release(pin)
-    assert_equal :stale, b.advance(pin, 5)
-    assert_equal :stale, b.checkpoint(pin, 1, 5)
-    assert_equal :stale, b.checkpoint_from(pin, Tracker.new(1, 5))
-    assert_nil b.pin_offset(pin)
-    assert_equal :stale, b.confirm_superseded(replacement)
-    assert_equal :stale, b.confirm_rewritten(replacement, 1, 1)
-    assert_equal :stale, b.reclaim(replacement)
-    assert_equal :stale, b.abort(replacement)
+  def test_handles_are_opaque_and_typed
+    journal, = journal_with(1)
+    pin = journal.pin_reader(0)
+    replacement = journal.propose(1)
     assert_raises(TypeError) { J::Pin.allocate }
     assert_raises(TypeError) { J::Replacement.allocate }
     assert_raises(TypeError) { J::Journal.allocate }
-    assert_raises(NoMethodError) { J::Journal.__open(0, 0, nil, nil, nil, 0) }
-    assert_raises(TypeError) { a.release(replacement) }
-    assert_raises(TypeError) { a.abort(pin) }
+    assert_raises(NoMethodError) { J::Journal.__open(0, 0, 0, [nil, nil, nil, 0]) }
+    assert_raises(TypeError) { journal.release(replacement) }
+    assert_raises(TypeError) { journal.abort(pin) }
   end
 end

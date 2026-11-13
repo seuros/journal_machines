@@ -102,7 +102,7 @@ class JournalTest < Minitest::Test
     replacement = journal.propose(sealed.first)
     assert_equal :recorded, journal.confirm_superseded(replacement)
     assert_instance_of J::Reclaimed, journal.reclaim(replacement)
-    assert_equal 65, journal.roll(1, 1, 0).opened
+    assert_equal 66, journal.roll(1, 1, 0).opened, 'ids ascend, not consecutive: the attempt took 65'
   end
 
   def test_compaction_candidates_are_bounded_and_resumable
@@ -135,10 +135,10 @@ class JournalTest < Minitest::Test
     assert_equal :unknown, journal.propose(9)
     replacement = journal.propose(sealed[0])
     assert_instance_of J::Replacement, replacement
-    assert_equal [1, 1], [replacement.segment, replacement.attempt]
+    assert_equal [1, 4], [replacement.segment, replacement.attempt]
     assert_equal :busy, journal.propose(sealed[0])
     assert_equal :proposed, journal.segment(1).state
-    assert_equal 1, journal.segment(1).replacement.attempt
+    assert_equal 4, journal.segment(1).replacement.attempt
     assert_equal :not_durable, journal.reclaim(replacement)
     assert_equal :exceeds, journal.confirm_rewritten(replacement, 1, 11)
     assert_equal :recorded, journal.confirm_rewritten(replacement, 30, 4)
@@ -148,9 +148,9 @@ class JournalTest < Minitest::Test
     assert_equal :reclaimable, journal.segment(1).state
     assert_equal [1], journal.reclaimable(nil, 64).map(&:id)
     reclaimed = journal.reclaim(journal.reclaimable(nil, 64).first.replacement)
-    assert_equal({ segment: 1, revision: 0, bytes: 100, replaced_by: 1 }, reclaimed.to_h)
+    assert_equal({ segment: 1, revision: 0, bytes: 100, replaced_by: 4 }, reclaimed.to_h)
     after = journal.segment(1)
-    assert_equal [:sealed, 1, 30, 10, 4, 4, nil],
+    assert_equal [:sealed, 4, 30, 10, 4, 4, nil],
                  [after.state, after.revision, after.bytes, after.records,
                   after.stored_records, after.live_records, after.replacement]
     assert_equal :stale, journal.reclaim(replacement)
@@ -180,7 +180,7 @@ class JournalTest < Minitest::Test
     reader = journal.pin_reader(3)
     checkpoint = journal.pin_checkpoint(1, 12)
     assert_equal %i[reader checkpoint], [reader.kind, checkpoint.kind]
-    assert_equal [1, 2], [reader.generation, checkpoint.generation]
+    assert_equal [4, 5], [reader.generation, checkpoint.generation]
     assert_equal [2, 3], [journal.pins, journal.low_pin]
     first = journal.propose(1)
     second = journal.propose(2)

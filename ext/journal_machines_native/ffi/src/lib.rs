@@ -2,9 +2,9 @@
 mod convert;
 mod init;
 
-use convert::{Number, answer, nanos, policy, refusal};
+use convert::{Number, Scope, answer, nanos, policy, refusal};
 
-use std::{cell::RefCell, num::NonZeroU64, sync::Arc};
+use std::{cell::RefCell, num::NonZeroU64};
 
 use journal_machines::{
     Advanced, Checkpointed, Confirmed, Durable, Pin, PinKind, Refusal, Replacement, Roll,
@@ -12,12 +12,14 @@ use journal_machines::{
 };
 use magnus::{Error, IntoValue, RArray, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
 
+/// The four `Policy` fields as Ruby passes them, in order.
+type Thresholds = (Option<Number>, Option<Number>, Option<Number>, Number);
+
 const SEGMENTS: usize = 64;
 const PINS: usize = 32;
 
 #[magnus::wrap(class = "JournalMachines::Pin", free_immediately, size)]
 struct PinHandle {
-    owner: Arc<()>,
     pin: Pin,
 }
 
@@ -32,11 +34,14 @@ impl PinHandle {
     const fn generation(&self) -> u64 {
         self.pin.generation()
     }
+
+    const fn scope(&self) -> u16 {
+        self.pin.scope()
+    }
 }
 
 #[magnus::wrap(class = "JournalMachines::Replacement", free_immediately, size)]
 struct ReplacementHandle {
-    owner: Arc<()>,
     replacement: Replacement,
 }
 
@@ -48,33 +53,47 @@ impl ReplacementHandle {
     const fn attempt(&self) -> u64 {
         self.replacement.attempt()
     }
+
+    const fn scope(&self) -> u16 {
+        self.replacement.scope()
+    }
 }
 
 #[magnus::wrap(class = "JournalMachines::Journal", free_immediately, size)]
 struct Journal {
-    owner: Arc<()>,
     core: RefCell<journal_machines::Journal<SEGMENTS, PINS>>,
 }
 
 impl Journal {
+    /// `Journal::resumed`; `Journal::with_scope` is the same with nothing
+    /// issued. Raises `RangeError` where the core answers `None`.
     fn open(
         ruby: &Ruby,
         base_offset: Number,
         now: Number,
-        max_bytes: Option<Number>,
-        max_records: Option<Number>,
-        max_age: Option<Number>,
-        min_dead_per_mille: Number,
+        (scope, issued): (Scope, Number),
+        (max_bytes, max_records, max_age, min_dead_per_mille): Thresholds,
     ) -> Result<Self, Error> {
         let policy = policy(ruby, max_bytes, max_records, max_age, min_dead_per_mille)?;
-        Ok(Self {
-            owner: Arc::new(()),
-            core: RefCell::new(journal_machines::Journal::new(
-                policy,
-                base_offset.0,
-                now.nanos(),
-            )),
-        })
+        let (base, now) = (base_offset.0, now.nanos());
+        journal_machines::Journal::resumed(policy, base, now, scope.0, issued.0)
+            .map(|core| Self {
+                core: RefCell::new(core),
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    ruby.exception_range_error(),
+                    "issued must leave an identity for the active segment: 0..2**48-2",
+                )
+            })
+    }
+
+    fn scope(&self) -> u16 {
+        self.core.borrow().scope()
+    }
+
+    fn issued(&self) -> u64 {
+        self.core.borrow().issued()
     }
 
     /// Raises where `Policy::new` answers `None`; `Policy.new` calls it.
@@ -158,7 +177,7 @@ impl Journal {
         Ok(answer(ruby, outcome, "recorded"))
     }
 
-    fn row(&self, ruby: &Ruby, segment: Segment) -> Result<RArray, Error> {
+    fn row(ruby: &Ruby, segment: Segment) -> Result<RArray, Error> {
         let row = ruby.ary_new_capa(11);
         row.push(segment.id.raw())?;
         row.push(segment.revision)?;
@@ -176,30 +195,31 @@ impl Journal {
             SegmentState::Reclaimable => "reclaimable",
         }))?;
         row.push(segment.pinned)?;
-        row.push(segment.replacement.map(|replacement| ReplacementHandle {
-            owner: Arc::clone(&self.owner),
-            replacement,
-        }))?;
+        row.push(
+            segment
+                .replacement
+                .map(|replacement| ReplacementHandle { replacement }),
+        )?;
         Ok(row)
     }
 
-    fn optional(&self, ruby: &Ruby, segment: Option<Segment>) -> Result<Option<RArray>, Error> {
-        segment.map(|segment| self.row(ruby, segment)).transpose()
+    fn optional(ruby: &Ruby, segment: Option<Segment>) -> Result<Option<RArray>, Error> {
+        segment.map(|segment| Self::row(ruby, segment)).transpose()
     }
 
     fn active(ruby: &Ruby, this: &Self) -> Result<Option<RArray>, Error> {
         let segment = this.core.borrow().active();
-        this.optional(ruby, segment)
+        Self::optional(ruby, segment)
     }
 
     fn segment(ruby: &Ruby, this: &Self, id: Number) -> Result<Option<RArray>, Error> {
         let segment = this.core.borrow().segment(SegmentId::from_raw(id.0));
-        this.optional(ruby, segment)
+        Self::optional(ruby, segment)
     }
 
     fn covering(ruby: &Ruby, this: &Self, offset: Number) -> Result<Option<RArray>, Error> {
         let segment = this.core.borrow().covering(offset.0);
-        this.optional(ruby, segment)
+        Self::optional(ruby, segment)
     }
 
     /// At most `limit` rows (clamped to the capacity) after segment `after`.
@@ -222,18 +242,14 @@ impl Journal {
         };
         let rows = ruby.ary_new_capa(take);
         for segment in segments.take(take) {
-            rows.push(this.row(ruby, segment)?)?;
+            rows.push(Self::row(ruby, segment)?)?;
         }
         Ok(rows)
     }
 
-    fn pinned(ruby: &Ruby, this: Obj<Self>, pin: Result<Pin, Refusal>) -> Value {
+    fn pinned(ruby: &Ruby, pin: Result<Pin, Refusal>) -> Value {
         match pin {
-            Ok(pin) => PinHandle {
-                owner: Arc::clone(&this.owner),
-                pin,
-            }
-            .into_value_with(ruby),
+            Ok(pin) => PinHandle { pin }.into_value_with(ruby),
             Err(error) => ruby.to_symbol(refusal(error)).as_value(),
         }
     }
@@ -241,7 +257,7 @@ impl Journal {
     fn pin_reader(ruby: &Ruby, this: Obj<Self>, offset: Number) -> Result<Value, Error> {
         this.check_frozen()?;
         let pin = this.core.borrow_mut().pin_reader(offset.0);
-        Ok(Self::pinned(ruby, this, pin))
+        Ok(Self::pinned(ruby, pin))
     }
 
     fn pin_checkpoint(
@@ -255,14 +271,7 @@ impl Journal {
             .core
             .borrow_mut()
             .pin_checkpoint(assignment.0, offset.0);
-        Ok(Self::pinned(ruby, this, pin))
-    }
-
-    /// A handle issued by another journal is stale here.
-    fn own_pin(&self, handle: &PinHandle) -> Result<Pin, Refusal> {
-        Arc::ptr_eq(&self.owner, &handle.owner)
-            .then_some(handle.pin)
-            .ok_or(Refusal::Stale)
+        Ok(Self::pinned(ruby, pin))
     }
 
     fn advance(
@@ -272,9 +281,7 @@ impl Journal {
         offset: Number,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let outcome = this
-            .own_pin(&handle)
-            .and_then(|pin| this.core.borrow_mut().advance(pin, offset.0));
+        let outcome = this.core.borrow_mut().advance(handle.pin, offset.0);
         Ok(ruby.to_symbol(match outcome {
             Ok(Advanced::Unchanged) => "unchanged",
             Ok(Advanced::Moved) => "moved",
@@ -290,11 +297,10 @@ impl Journal {
         offset: Number,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let outcome = this.own_pin(&handle).and_then(|pin| {
-            this.core
-                .borrow_mut()
-                .checkpoint(pin, assignment.0, offset.0)
-        });
+        let outcome = this
+            .core
+            .borrow_mut()
+            .checkpoint(handle.pin, assignment.0, offset.0);
         Ok(ruby.to_symbol(match outcome {
             Ok(Checkpointed::Reassigned) => "reassigned",
             Ok(Checkpointed::Unchanged) => "unchanged",
@@ -305,16 +311,12 @@ impl Journal {
 
     fn release(ruby: &Ruby, this: Obj<Self>, handle: Obj<PinHandle>) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let outcome = this
-            .own_pin(&handle)
-            .and_then(|pin| this.core.borrow_mut().release(pin));
+        let outcome = this.core.borrow_mut().release(handle.pin);
         Ok(answer(ruby, outcome, "released"))
     }
 
     fn pin_offset(&self, handle: Obj<PinHandle>) -> Option<u64> {
-        self.own_pin(&handle)
-            .ok()
-            .and_then(|pin| self.core.borrow().pin_offset(pin))
+        self.core.borrow().pin_offset(handle.pin)
     }
 
     fn low_pin(&self) -> Option<u64> {
@@ -329,20 +331,9 @@ impl Journal {
         this.check_frozen()?;
         let proposed = this.core.borrow_mut().propose(SegmentId::from_raw(id.0));
         Ok(match proposed {
-            Ok(replacement) => ReplacementHandle {
-                owner: Arc::clone(&this.owner),
-                replacement,
-            }
-            .into_value_with(ruby),
+            Ok(replacement) => ReplacementHandle { replacement }.into_value_with(ruby),
             Err(error) => ruby.to_symbol(refusal(error)).as_value(),
         })
-    }
-
-    /// A handle issued by another journal is stale here.
-    fn own_replacement(&self, handle: &ReplacementHandle) -> Result<Replacement, Refusal> {
-        Arc::ptr_eq(&self.owner, &handle.owner)
-            .then_some(handle.replacement)
-            .ok_or(Refusal::Stale)
     }
 
     fn confirm(
@@ -353,8 +344,9 @@ impl Journal {
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
         let outcome = this
-            .own_replacement(&handle)
-            .and_then(|replacement| this.core.borrow_mut().confirm_durable(replacement, durable));
+            .core
+            .borrow_mut()
+            .confirm_durable(handle.replacement, durable);
         Ok(ruby.to_symbol(match outcome {
             Ok(Confirmed::AlreadyDurable) => "already_durable",
             Ok(Confirmed::Recorded) => "recorded",
@@ -390,9 +382,7 @@ impl Journal {
         handle: Obj<ReplacementHandle>,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let outcome = this
-            .own_replacement(&handle)
-            .and_then(|replacement| this.core.borrow_mut().reclaim(replacement));
+        let outcome = this.core.borrow_mut().reclaim(handle.replacement);
         Ok(match outcome {
             Ok(reclaimed) => (
                 reclaimed.segment.raw(),
@@ -411,9 +401,7 @@ impl Journal {
         handle: Obj<ReplacementHandle>,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let outcome = this
-            .own_replacement(&handle)
-            .and_then(|replacement| this.core.borrow_mut().abort(replacement));
+        let outcome = this.core.borrow_mut().abort(handle.replacement);
         Ok(answer(ruby, outcome, "aborted"))
     }
 }

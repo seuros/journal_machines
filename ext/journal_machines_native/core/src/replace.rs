@@ -1,11 +1,14 @@
 //! Replacement lifecycle: proposed, durable-confirmed, reclaimed.
+use periscope_machines::scope_of;
+
 use crate::{Journal, Phase, Refusal, SegmentId};
 
 /// Handle to one replacement attempt for one sealed segment.
 ///
-/// A handle means something only to the journal that issued it. It is a
-/// plain segment id and attempt number, so a journal cannot tell a foreign
-/// handle from its own.
+/// A handle means something only to the journal that issued it. Its segment
+/// id and its attempt number both carry that journal's scope, so a journal of
+/// another scope refuses it; two journals left in the same scope cannot tell
+/// each other's handles apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Replacement {
     pub(crate) segment: SegmentId,
@@ -19,10 +22,19 @@ impl Replacement {
         self.segment
     }
 
-    /// Journal-unique attempt number; a rewrite becomes this revision.
+    /// Journal-unique attempt number, never reissued: the journal's scope
+    /// above a number of the one sequence its segment ids and pin generations
+    /// are drawn from too. A rewrite becomes this revision.
     #[must_use]
     pub const fn attempt(self) -> u64 {
         self.attempt
+    }
+
+    /// The scope of the journal that issued this attempt, see
+    /// [`Journal::with_scope`].
+    #[must_use]
+    pub const fn scope(self) -> u16 {
+        scope_of(self.attempt)
     }
 }
 
@@ -68,8 +80,9 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// Open a replacement attempt for a sealed segment.
     ///
     /// # Errors
-    /// [`Refusal::Unknown`], [`Refusal::Active`], [`Refusal::Busy`] or
-    /// [`Refusal::Exhausted`] (attempts); a refusal changes nothing.
+    /// [`Refusal::Unknown`] (which includes an identity of another scope),
+    /// [`Refusal::Active`], [`Refusal::Busy`] or [`Refusal::Exhausted`]; a
+    /// refusal changes nothing.
     pub fn propose(&mut self, id: SegmentId) -> Result<Replacement, Refusal> {
         let index = self.index_of(id).ok_or(Refusal::Unknown)?;
         let slot = self.slots[index].as_mut().ok_or(Refusal::Unknown)?;
@@ -78,8 +91,10 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
             Phase::Proposed(_) | Phase::Durable(..) => return Err(Refusal::Busy),
             Phase::Sealed => {}
         }
-        let attempt = self.attempts.checked_add(1).ok_or(Refusal::Exhausted)?;
-        self.attempts = attempt;
+        let attempt = match self.issuer.issue() {
+            Ok(attempt) => attempt,
+            Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
+        };
         slot.phase = Phase::Proposed(attempt);
         Ok(Replacement {
             segment: id,
@@ -96,7 +111,8 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// and is refused: the first confirmation stands.
     ///
     /// # Errors
-    /// [`Refusal::Stale`], [`Refusal::Mismatch`] for an attempt already
+    /// [`Refusal::Stale`] (not the segment's current attempt, or a handle of
+    /// another scope), [`Refusal::Mismatch`] for an attempt already
     /// durable with a different `durable`, or, for a rewrite holding more
     /// records than the original stored, [`Refusal::Exceeds`]; a refusal
     /// changes nothing.
@@ -105,10 +121,8 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
         replacement: Replacement,
         durable: Durable,
     ) -> Result<Confirmed, Refusal> {
-        let slot = self
-            .index_of(replacement.segment)
-            .and_then(|index| self.slots[index].as_mut())
-            .ok_or(Refusal::Stale)?;
+        let index = self.replaced(replacement)?;
+        let slot = self.slots[index].as_mut().ok_or(Refusal::Stale)?;
         match slot.phase {
             Phase::Proposed(attempt) if attempt == replacement.attempt => {}
             Phase::Durable(attempt, recorded) if attempt == replacement.attempt => {
@@ -139,7 +153,7 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// [`Refusal::Stale`], [`Refusal::NotDurable`] or [`Refusal::Pinned`];
     /// a refusal changes nothing.
     pub fn reclaim(&mut self, replacement: Replacement) -> Result<Reclaimed, Refusal> {
-        let index = self.index_of(replacement.segment).ok_or(Refusal::Stale)?;
+        let index = self.replaced(replacement)?;
         let slot = self.slots[index].ok_or(Refusal::Stale)?;
         let durable = match slot.phase {
             Phase::Durable(attempt, durable) if attempt == replacement.attempt => durable,
@@ -189,10 +203,8 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// # Errors
     /// [`Refusal::Stale`]; nothing was abandoned.
     pub fn abort(&mut self, replacement: Replacement) -> Result<(), Refusal> {
-        let slot = self
-            .index_of(replacement.segment)
-            .and_then(|index| self.slots[index].as_mut())
-            .ok_or(Refusal::Stale)?;
+        let index = self.replaced(replacement)?;
+        let slot = self.slots[index].as_mut().ok_or(Refusal::Stale)?;
         match slot.phase {
             Phase::Proposed(attempt) | Phase::Durable(attempt, _)
                 if attempt == replacement.attempt =>
@@ -204,5 +216,15 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
                 Err(Refusal::Stale)
             }
         }
+    }
+
+    /// Slot of the segment a handle names. A handle whose attempt or segment
+    /// this journal never issued, of another scope or not yet reached, names
+    /// nothing here: no slot is read.
+    fn replaced(&self, replacement: Replacement) -> Result<usize, Refusal> {
+        if !self.issuer.owns(replacement.attempt) {
+            return Err(Refusal::Stale);
+        }
+        self.index_of(replacement.segment).ok_or(Refusal::Stale)
     }
 }

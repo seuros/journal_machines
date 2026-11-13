@@ -11,13 +11,17 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     pin.undef_default_alloc_func();
     pin.define_method("kind", method!(PinHandle::kind, 0))?;
     pin.define_method("generation", method!(PinHandle::generation, 0))?;
+    pin.define_method("scope", method!(PinHandle::scope, 0))?;
     let replacement = module.define_class("Replacement", ruby.class_object())?;
     replacement.undef_default_alloc_func();
     replacement.define_method("segment", method!(ReplacementHandle::segment, 0))?;
     replacement.define_method("attempt", method!(ReplacementHandle::attempt, 0))?;
+    replacement.define_method("scope", method!(ReplacementHandle::scope, 0))?;
     let class = module.define_class("Journal", ruby.class_object())?;
     class.undef_default_alloc_func();
-    class.define_singleton_method("__open", function!(Journal::open, 6))?;
+    class.define_singleton_method("__open", function!(Journal::open, 4))?;
+    class.define_method("scope", method!(Journal::scope, 0))?;
+    class.define_method("issued", method!(Journal::issued, 0))?;
     class.define_singleton_method("__check_policy", function!(Journal::check_policy, 4))?;
     class.define_method("__policy", method!(Journal::policy, 0))?;
     class.define_method("size", method!(Journal::size, 0))?;

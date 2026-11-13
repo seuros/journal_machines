@@ -1,6 +1,8 @@
 //! A naive, growable model of the journal, written without sharing its code.
 use std::vec::Vec;
 
+use periscope_machines::scoped;
+
 use super::at;
 use crate::*;
 
@@ -37,9 +39,10 @@ pub struct Model {
     pub per_mille: u64,
     pub segments: Vec<ModelSegment>,
     pub pins: Vec<ModelPin>,
-    pub ids: u64,
-    pub attempts: u64,
-    pub generations: u64,
+    pub scope: u16,
+    /// Sequence number of the last identity issued, of whichever kind: ids,
+    /// attempts and generations are drawn from the one sequence.
+    pub issued: u64,
 }
 
 impl Model {
@@ -144,11 +147,12 @@ impl Model {
         active.bytes = bytes;
         active.sealed = true;
         let (sealed, next_offset) = (active.id, active.base + records);
-        self.ids += 1;
-        self.segments.push(Self::open(self.ids, next_offset, now));
+        self.issued += 1;
+        let opened = scoped(self.scope, self.issued);
+        self.segments.push(Self::open(opened, next_offset, now));
         Ok(Rolled {
             sealed: SegmentId::from_raw(sealed),
-            opened: SegmentId::from_raw(self.ids),
+            opened: SegmentId::from_raw(opened),
             next_offset,
         })
     }
@@ -179,20 +183,22 @@ impl Model {
         let slot = (0..PINS)
             .find(|slot| self.pins.iter().all(|pin| pin.slot != *slot))
             .expect("a free slot");
-        self.generations += 1;
+        self.issued += 1;
+        let generation = scoped(self.scope, self.issued);
         self.pins.push(ModelPin {
             slot,
-            generation: self.generations,
+            generation,
             reader,
             offset,
             assignment,
         });
-        Ok(self.generations)
+        Ok(generation)
     }
 
-    /// The pin a handle names. A handle is a slot and a generation and
-    /// nothing else: one forged or issued by another journal that names a
-    /// held pin is that pin, and any other is held by nobody.
+    /// The pin a handle names. A handle is a slot and a scoped generation
+    /// and nothing else: one issued by another journal of the same scope that
+    /// names a held pin is that pin, and any other is held by nobody. A
+    /// generation of another scope equals none held here.
     pub fn held(&mut self, handle: Pin) -> Option<&mut ModelPin> {
         self.pins
             .iter_mut()
@@ -233,14 +239,15 @@ impl Model {
         }
     }
 
+    /// Only a held pin is released; nothing remembers the ones that were.
     pub fn release(&mut self, handle: Pin) -> Result<(), Refusal> {
-        let generation = self.held(handle).ok_or(Refusal::Stale)?.generation;
-        self.pins.retain(|pin| pin.generation != generation);
+        self.held(handle).ok_or(Refusal::Stale)?;
+        self.pins.retain(|pin| pin.generation != handle.generation);
         Ok(())
     }
 
     pub fn propose(&mut self, id: u64) -> Result<u64, Refusal> {
-        let attempt = self.attempts + 1;
+        let attempt = scoped(self.scope, self.issued + 1);
         let segment = self.find(id).ok_or(Refusal::Unknown)?;
         if !segment.sealed {
             return Err(Refusal::Active);
@@ -249,7 +256,7 @@ impl Model {
             return Err(Refusal::Busy);
         }
         segment.attempt = Some(attempt);
-        self.attempts = attempt;
+        self.issued += 1;
         Ok(attempt)
     }
 

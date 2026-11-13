@@ -9,8 +9,24 @@ mod pins;
 mod random;
 mod refusals;
 mod repeats;
+mod resume;
+mod scope;
 
 type Small = Journal<4, 2>;
+
+/// A journal of `scope` whose sequence has `left` identities to issue after
+/// its active segment took one, seeded through the public constructor.
+fn worn(scope: u16, left: u64) -> Small {
+    let issued = periscope_machines::SEQUENCE_MAX - left - 1;
+    Small::resumed(policy(0, 0, 0, 500), 0, at(0), scope, issued).expect("resumed")
+}
+
+/// A journal whose sequence is spent, with one sealed segment to name.
+fn spent() -> (Small, SegmentId) {
+    let mut journal = worn(0, 1);
+    let sealed = journal.roll(1, 1, at(0)).expect("roll").sealed;
+    (journal, sealed)
+}
 
 /// A monotonic instant or span of `seconds`.
 const fn at(seconds: u64) -> Duration {
@@ -164,7 +180,8 @@ fn full_journal_refuses_to_roll_without_changing() {
     assert!(journal.reclaim(replacement).is_ok());
     assert_eq!(
         journal.roll(1, 1, at(0)).map(|rolled| rolled.opened.raw()),
-        Ok(5)
+        Ok(6),
+        "ids ascend but are not consecutive: the attempt took 5"
     );
 }
 
@@ -239,7 +256,7 @@ fn replacement_moves_from_proposed_to_durable_to_reclaimed() {
         Err(Refusal::Unknown)
     );
     let first = journal.propose(sealed[0]).expect("propose");
-    assert_eq!((first.segment(), first.attempt()), (sealed[0], 1));
+    assert_eq!((first.segment(), first.attempt()), (sealed[0], 4));
     assert_eq!(journal.propose(sealed[0]), Err(Refusal::Busy));
     assert_eq!(state(&journal, sealed[0]), Some(SegmentState::Proposed));
     assert_eq!(
@@ -288,11 +305,11 @@ fn replacement_moves_from_proposed_to_durable_to_reclaimed() {
             segment: sealed[0],
             revision: 0,
             bytes: 100,
-            replaced_by: Some(1)
+            replaced_by: Some(4)
         }
     );
     let after = journal.segment(sealed[0]).expect("kept");
-    assert_eq!((after.revision, after.bytes, after.records), (1, 30, 10));
+    assert_eq!((after.revision, after.bytes, after.records), (4, 30, 10));
     assert_eq!((after.stored_records, after.live_records), (4, 4));
     assert_eq!(
         (after.state, after.replacement),
@@ -351,6 +368,6 @@ fn aborted_attempts_leave_stale_handles_and_live_counts_carry_over() {
             segment.live_records,
             segment.revision
         ),
-        (6, 3, 2)
+        (6, 3, 4)
     );
 }

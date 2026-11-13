@@ -2,7 +2,7 @@
 //! bit-for-bit unchanged.
 use std::string::ToString;
 
-use super::{Small, at, journal_with, policy};
+use super::{Small, at, journal_with, policy, spent};
 use crate::*;
 
 /// Run `call`, expect `want`, and prove the journal did not change.
@@ -79,7 +79,9 @@ fn pin_refusals_change_nothing() {
     refused(&mut journal, Refusal::PinsFull, |j| j.pin_checkpoint(1, 0));
     refused(&mut journal, Refusal::Stale, |j| j.advance(gone, 9));
     refused(&mut journal, Refusal::Stale, |j| j.checkpoint(gone, 3, 9));
+    // Nothing remembers a released pin: releasing it again is not provable.
     refused(&mut journal, Refusal::Stale, |j| j.release(gone));
+    // A journal that has issued no pin never issued this one.
     let mut other = Small::new(policy(0, 0, 0, 500), 0, at(0));
     refused(&mut other, Refusal::Stale, |j| j.release(checkpoint));
     refused(&mut journal, Refusal::WrongKind, |j| {
@@ -158,12 +160,10 @@ fn replacement_refusals_change_nothing() {
 
 #[test]
 fn spent_identity_spaces_are_exhausted_not_overflow() {
-    let (mut worn, sealed) = journal_with(1);
-    worn.issued = u64::MAX;
-    worn.attempts = u64::MAX;
-    worn.pin_generations = u64::MAX;
+    let (mut worn, sealed) = spent();
+    assert_eq!(worn.issued(), periscope_machines::SEQUENCE_MAX);
     refused(&mut worn, Refusal::Exhausted, |j| j.roll(1, 1, at(0)));
-    refused(&mut worn, Refusal::Exhausted, |j| j.propose(sealed[0]));
+    refused(&mut worn, Refusal::Exhausted, |j| j.propose(sealed));
     refused(&mut worn, Refusal::Exhausted, |j| j.pin_reader(0));
     refused(&mut worn, Refusal::Exhausted, |j| j.pin_checkpoint(1, 0));
 }

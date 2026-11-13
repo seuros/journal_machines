@@ -13,9 +13,16 @@ pub use replace::{Confirmed, Durable, Reclaimed, Replacement};
 
 use core::time::Duration;
 
+use periscope_machines::{Issuer, scope_of};
 use pins::PinSlot;
 
 /// Journal-issued segment identity, ascending in offset order.
+///
+/// It carries the scope of the journal that issued it above a sequence
+/// number. The journal draws segment ids, pin generations and attempt numbers
+/// from one sequence, so ids ascend but are not consecutive, and no pin
+/// generation or attempt of the same journal has the same raw value. A
+/// journal of another scope knows no segment by it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SegmentId(u64);
 
@@ -30,6 +37,13 @@ impl SegmentId {
     #[must_use]
     pub const fn raw(self) -> u64 {
         self.0
+    }
+
+    /// The scope of the journal that issued this identity, see
+    /// [`Journal::with_scope`].
+    #[must_use]
+    pub const fn scope(self) -> u16 {
+        scope_of(self.0)
     }
 }
 
@@ -155,10 +169,10 @@ pub struct Journal<const SEGMENTS: usize, const PINS: usize> {
     pub(crate) policy: Policy,
     pub(crate) slots: [Option<Slot>; SEGMENTS],
     pub(crate) len: usize,
-    pub(crate) issued: u64,
-    pub(crate) attempts: u64,
+    /// The one sequence every segment id, pin generation and replacement
+    /// attempt is drawn from, so no two handles share a raw value.
+    pub(crate) issuer: Issuer,
     pub(crate) pins: [Option<PinSlot>; PINS],
-    pub(crate) pin_generations: u64,
 }
 
 impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
@@ -167,26 +181,97 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// Pin slots, readers and checkpoints together.
     pub const PIN_CAPACITY: usize = PINS;
 
-    /// Start with one active segment at `base_offset`, opened at `now`:
-    /// monotonic time since an epoch the caller picks.
+    /// Start in scope zero with one active segment at `base_offset`, opened
+    /// at `now`: monotonic time since an epoch the caller picks.
     #[must_use]
     pub const fn new(policy: Policy, base_offset: u64, now: Duration) -> Self {
-        let mut slots = [None; SEGMENTS];
-        let len = if let Some(first) = slots.first_mut() {
-            *first = Some(Slot::active(1, base_offset, now));
-            1
-        } else {
-            0
+        Self::with_scope(policy, base_offset, now, 0)
+    }
+
+    /// Start as [`Journal::new`] does, issuing segment ids, pin generations
+    /// and replacement attempts that carry `scope`.
+    ///
+    /// All three come from one sequence counted from one, so no two handles
+    /// of a journal share a raw value; the active segment takes the first.
+    /// Two journals in the same scope issue the same values, and a handle
+    /// given to the wrong journal names something real there. Give every
+    /// journal whose handles could meet its own scope: an identity of another
+    /// scope then names nothing, and every call that takes one refuses it
+    /// before looking anything up. The journal cannot pick a scope itself;
+    /// keeping them distinct is the caller's job.
+    #[must_use]
+    pub const fn with_scope(policy: Policy, base_offset: u64, now: Duration, scope: u16) -> Self {
+        Self::opened(policy, base_offset, now, Issuer::new(scope)).0
+    }
+
+    /// Start as [`Journal::with_scope`] does after a restart, continuing the
+    /// sequence of an earlier journal of `scope` that had issued `issued`
+    /// identities (its [`Journal::issued`]). Segments and pins are not
+    /// restored: the journal has one active segment at `base_offset`, and its
+    /// id is the next of the sequence.
+    ///
+    /// A journal started again with [`Journal::with_scope`] reissues the
+    /// identities of the one before it, so a handle that outlived the restart
+    /// could name a new entry. Resume from the saved count, or give each
+    /// incarnation a scope of its own. Resuming from a count lower than what
+    /// was really issued reissues too: save [`Journal::issued`] before
+    /// handing an identity out.
+    ///
+    /// `None` when `issued` is beyond what a scope holds, or leaves no
+    /// identity for the active segment.
+    #[must_use]
+    pub const fn resumed(
+        policy: Policy,
+        base_offset: u64,
+        now: Duration,
+        scope: u16,
+        issued: u64,
+    ) -> Option<Self> {
+        let Some(sequence) = Issuer::resumed(scope, issued) else {
+            return None;
         };
-        Self {
+        match Self::opened(policy, base_offset, now, sequence) {
+            (journal, true) => Some(journal),
+            (_, false) => None,
+        }
+    }
+
+    /// A journal on `issuer`, and whether every segment slot it needs (one,
+    /// or none at zero capacity) got its identity.
+    const fn opened(policy: Policy, base: u64, now: Duration, mut issuer: Issuer) -> (Self, bool) {
+        let mut slots = [None; SEGMENTS];
+        let (mut len, mut complete) = (0, true);
+        if let Some(first) = slots.first_mut() {
+            match issuer.issue() {
+                Ok(id) => {
+                    *first = Some(Slot::active(id, base, now));
+                    len = 1;
+                }
+                Err(periscope_machines::Refusal::Exhausted) => complete = false,
+            }
+        }
+        let journal = Self {
             policy,
             slots,
             len,
-            issued: len as u64,
-            attempts: 0,
+            issuer,
             pins: [None; PINS],
-            pin_generations: 0,
-        }
+        };
+        (journal, complete)
+    }
+
+    /// The scope carried by every identity this journal issues.
+    #[must_use]
+    pub const fn scope(&self) -> u16 {
+        self.issuer.scope()
+    }
+
+    /// How many identities (segment ids, pin generations and attempts
+    /// together) this journal's sequence has issued; what
+    /// [`Journal::resumed`] continues from.
+    #[must_use]
+    pub const fn issued(&self) -> u64 {
+        self.issuer.issued()
     }
 
     /// The thresholds this journal decides with.
@@ -213,7 +298,7 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
         self.active_slot().map(|slot| self.view(&slot))
     }
 
-    /// One segment's metadata.
+    /// One segment's metadata; `None` for an identity of another scope.
     #[must_use]
     pub fn segment(&self, id: SegmentId) -> Option<Segment> {
         let slot = self.slots[self.index_of(id)?]?;
@@ -234,7 +319,8 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     }
 
     /// Every segment after `after` in ascending identity order. Resume by
-    /// passing the last identity yielded.
+    /// passing the last identity yielded. An `after` of another scope is no
+    /// position in this journal: the iterator is empty.
     #[must_use]
     pub fn segments(&self, after: Option<SegmentId>) -> Segments<'_, SEGMENTS, PINS> {
         self.scan(after, Filter::All)
@@ -283,7 +369,7 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// # Errors
     /// [`Refusal::NoActive`], [`Refusal::Empty`], [`Refusal::TimeRegression`],
     /// [`Refusal::Overflow`], [`Refusal::SegmentsFull`] or
-    /// [`Refusal::Exhausted`] (segment ids); a refusal changes nothing.
+    /// [`Refusal::Exhausted`]; a refusal changes nothing.
     pub fn roll(&mut self, bytes: u64, records: u64, now: Duration) -> Result<Rolled, Refusal> {
         let mut sealed = self.active_slot().ok_or(Refusal::NoActive)?;
         if records == 0 {
@@ -296,7 +382,10 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
         if self.len == SEGMENTS {
             return Err(Refusal::SegmentsFull);
         }
-        let opened = self.issued.checked_add(1).ok_or(Refusal::Exhausted)?;
+        let opened = match self.issuer.issue() {
+            Ok(opened) => opened,
+            Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
+        };
         sealed.span = records;
         sealed.stored = records;
         sealed.live = records;
@@ -305,7 +394,6 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
         self.slots[self.len - 1] = Some(sealed);
         self.slots[self.len] = Some(Slot::active(opened, next_offset, now));
         self.len += 1;
-        self.issued = opened;
         Ok(Rolled {
             sealed: SegmentId(sealed.id),
             opened: SegmentId(opened),
@@ -316,8 +404,8 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// Record how many of a sealed segment's stored records are still live.
     ///
     /// # Errors
-    /// [`Refusal::Unknown`], [`Refusal::Active`] or [`Refusal::Exceeds`];
-    /// a refusal changes nothing.
+    /// [`Refusal::Unknown`] (which includes an identity of another scope),
+    /// [`Refusal::Active`] or [`Refusal::Exceeds`]; a refusal changes nothing.
     pub fn observe_live(&mut self, id: SegmentId, live_records: u64) -> Result<(), Refusal> {
         let slot = self
             .index_of(id)
@@ -333,7 +421,12 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
         Ok(())
     }
 
+    /// An identity this journal never issued, of another scope or not yet
+    /// reached, names nothing here: no slot is read.
     pub(crate) fn index_of(&self, id: SegmentId) -> Option<usize> {
+        if !self.issuer.owns(id.0) {
+            return None;
+        }
         self.slots[..self.len]
             .iter()
             .position(|slot| slot.is_some_and(|slot| slot.id == id.0))
@@ -374,12 +467,14 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     }
 
     fn scan(&self, after: Option<SegmentId>, filter: Filter) -> Segments<'_, SEGMENTS, PINS> {
-        let index = after.map_or(0, |after| {
-            self.slots[..self.len]
+        let index = match after {
+            None => 0,
+            Some(after) if after.scope() != self.scope() => self.len,
+            Some(after) => self.slots[..self.len]
                 .iter()
                 .position(|slot| slot.is_some_and(|slot| slot.id > after.0))
-                .unwrap_or(self.len)
-        });
+                .unwrap_or(self.len),
+        };
         Segments {
             journal: self,
             index,

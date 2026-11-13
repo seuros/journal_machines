@@ -1,7 +1,7 @@
 //! Pins, reclamation gating and integer limits.
 use offset_machines::{Ack, Commit, Tracker};
 
-use super::{Small, at, ids, journal_with, policy};
+use super::{Small, at, ids, journal_with, policy, spent};
 use crate::*;
 
 #[test]
@@ -199,11 +199,7 @@ fn u64_limits_refuse_instead_of_wrapping() {
         Some(false)
     );
 
-    let mut worn = Small::new(policy(0, 0, 0, 500), 0, at(0));
-    let sealed = worn.roll(1, 1, at(0)).expect("roll").sealed;
-    worn.issued = u64::MAX;
-    worn.attempts = u64::MAX;
-    worn.pin_generations = u64::MAX;
+    let (mut worn, sealed) = spent();
     let before = worn.clone();
     assert_eq!(worn.roll(1, 1, at(0)), Err(Refusal::Exhausted));
     assert_eq!(worn.propose(sealed), Err(Refusal::Exhausted));

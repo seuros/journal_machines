@@ -11,5 +11,6 @@ keywords = ["journal", "segment", "compaction", "retention", "no-std"]
 categories = ["no-std", "algorithms"]
 [dependencies]
 offset-machines.workspace = true
+periscope-machines.workspace = true
 [lints]
 workspace = true

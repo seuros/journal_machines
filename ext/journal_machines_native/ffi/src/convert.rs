@@ -19,6 +19,25 @@ impl TryConvert for Number {
     }
 }
 
+/// A scope: an Integer in `0..=65535`.
+#[derive(Clone, Copy)]
+pub struct Scope(pub u16);
+
+impl TryConvert for Scope {
+    fn try_convert(value: Value) -> Result<Self, Error> {
+        let ruby = Ruby::get_with(value);
+        if Integer::from_value(value).is_none() {
+            return Err(Error::new(
+                ruby.exception_type_error(),
+                "scope must be an Integer",
+            ));
+        }
+        u16::try_convert(value)
+            .map(Self)
+            .map_err(|_| Error::new(ruby.exception_range_error(), "scope must be in 0..=65535"))
+    }
+}
+
 impl Number {
     /// A monotonic instant or span given as Integer nanoseconds.
     pub const fn nanos(self) -> Duration {

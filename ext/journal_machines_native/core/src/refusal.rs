@@ -9,7 +9,14 @@ use core::fmt;
 /// payload is honoured as [`Advanced::Unchanged`](crate::Advanced),
 /// [`Checkpointed::Unchanged`](crate::Checkpointed) or
 /// [`Confirmed::AlreadyDurable`](crate::Confirmed). A repeat it cannot prove
-/// is refused: releasing a pin that is no longer held is [`Refusal::Stale`].
+/// is refused: a second `release`, `reclaim` or `abort` is
+/// [`Refusal::Stale`], because the journal keeps neither the pins it released
+/// nor how an attempt ended.
+///
+/// Every identity the journal issues carries its scope and a number of its
+/// one sequence. One it never issued, of another scope or not yet reached,
+/// names nothing here and is refused before anything is looked up: a segment
+/// id is [`Refusal::Unknown`], a pin or a replacement is [`Refusal::Stale`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     /// The journal has no active segment (zero segment capacity).
@@ -24,10 +31,10 @@ pub enum Refusal {
     SegmentsFull,
     /// Every pin slot is held; release before pinning.
     PinsFull,
-    /// A journal-issued identity space (segment ids, pin generations or
-    /// replacement attempts) is spent.
+    /// The journal's identity sequence is spent: a scope holds 2^48 - 1
+    /// segment ids, pin generations and replacement attempts together.
     Exhausted,
-    /// No such segment.
+    /// No such segment, which includes an identity of another scope.
     Unknown,
     /// The segment is the active one, still being written.
     Active,
@@ -38,9 +45,9 @@ pub enum Refusal {
     /// The attempt is already confirmed durable with a different payload
     /// than this call carries; the recorded confirmation stands.
     Mismatch,
-    /// The handle is not current: a pin that is not held (released, or
-    /// never issued by this journal), or a replacement that is not the
-    /// segment's current attempt.
+    /// The handle is not current: a pin that is not held (a released one
+    /// included), a replacement that is not the segment's current attempt, or
+    /// a handle this journal never issued.
     Stale,
     /// A reader call on a checkpoint pin, or the reverse.
     WrongKind,

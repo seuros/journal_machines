@@ -220,7 +220,7 @@ journal.release(reader)        # => :stale
 journal.advance(reader, 11)    # => :stale
 ```
 
-Release is checked against the acquisition, not the slot. Once released, a pin handle is dead for good, even after the journal hands the same slot to someone else: every call with it, a second `release` included, is `:stale` and leaves the new holder alone. A second release isn't answered as a repeat because the journal keeps no list of the pins it handed out. It knows what is held now, and nothing about what was held before.
+Release is checked against the acquisition, not the slot. Once released, a pin handle never names a pin again, even after the journal hands the same slot to someone else: `advance`, `checkpoint` and `pin_offset` answer `:stale` (or `nil`) and leave the new holder alone. A second `release` is `:stale` too, and changes nothing. The journal keeps no list of released pins, and it can't work the answer out: pins, segments and attempts are numbered from one sequence, so "one of my numbers that no pin holds" is just as true of a segment id. It only honours a repeat it can prove. A pin it never issued, from a journal of another scope or with a number it hasn't reached, is `:stale` as well.
 
 Moving a pin to where it already sits is `:unchanged`, an answer and not a refusal. Moving it back is `:regressed`, a refusal: the journal may already have let go of what lies behind the pin, so it cannot promise it again.
 
@@ -276,7 +276,7 @@ journal.advance(reader, 10)                     # => :moved
 reclaimed = journal.reclaim(replacement)
 reclaimed.revision      # => 0, the file to delete
 reclaimed.bytes         # => 100
-reclaimed.replaced_by   # => 1, the revision now serving 0...10
+reclaimed.replaced_by   # => 4, the revision now serving 0...10: the attempt number
 ```
 
 Two conditions, both required: the replacement is confirmed durable, and no pin of either kind sits below the segment's end. Miss one and you get a symbol and nothing changes. A rewritten segment keeps its id and its offsets under a new revision. A superseded one leaves the journal and `replaced_by` is `nil`.
@@ -346,13 +346,13 @@ Each refusal means one thing wherever it shows up:
 | `:overflow` | The offset range would pass `2**64 - 1`. |
 | `:segments_full` | All 64 segment slots are taken. Reclaim one. |
 | `:pins_full` | All 32 pin slots are held. Release one. |
-| `:exhausted` | The journal ran out of segment ids, pin generations or attempt numbers. That takes `2**64` of them. |
+| `:exhausted` | The journal ran out of numbers for segment ids, pin generations and attempts. That takes `2**48 - 1` of them, all kinds together, per scope. |
 | `:unknown` | No segment has that id. |
 | `:active` | That is the active segment, still being written. |
 | `:busy` | The segment already has a replacement in flight. |
 | `:exceeds` | More live records than the segment stores. |
 | `:mismatch` | The attempt is already durable, but not with this: `confirm_superseded` after `confirm_rewritten` or the reverse, or `confirm_rewritten` with other bytes or another record count. The first confirmation stands. |
-| `:stale` | The `Pin` or `Replacement` is not current: released, aborted, reclaimed, superseded by a newer attempt, or from another journal. A second `release` of the same pin is `:stale` too. |
+| `:stale` | The `Pin` or `Replacement` is not current: released, aborted, reclaimed, superseded by a newer attempt, or one this journal never issued (another scope, or a number it hasn't reached). Releasing a pin twice is `:stale`. |
 | `:wrong_kind` | `advance` on a checkpoint pin, or `checkpoint` on a reader pin. |
 | `:unassigned` | Assignment generation zero is not an assignment. |
 | `:stale_assignment` | The assignment generation is older than the one the checkpoint holds. |
@@ -366,9 +366,10 @@ The queries `active`, `segment`, `covering`, `segments`, `compaction_candidates`
 
 - **Everything is an Integer** in `0..2**64-1`: offsets, sizes, counts, times, ids, generations. Floats, nil, and strings raise `TypeError`. Out of range raises `RangeError`. A threshold may be `nil`, never zero. A missing argument raises `ArgumentError`: nothing has a default.
 - **Time is Integer nanoseconds.** `now` (in `Journal.new`, `roll_decision` and `roll`), `max_age` and `Segment#opened_at` are nanoseconds on one monotonic clock: `Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)`. A Float or any other non-Integer raises `TypeError`; a negative value or one past `2**64-1` raises `RangeError`.
-- **Handles belong to one journal.** A `Pin` or `Replacement` is only meaningful to the `Journal` that issued it. Every other journal answers `:stale` (and `nil` from `pin_offset`). Handles can't be built by hand.
+- **Scopes.** A `Pin`, a `Replacement` and a segment id are only meaningful to the `Journal` that issued them. They are numbered from 1, so two journals hand out the same ones, and a handle given to the wrong journal would name a live pin or attempt there. One journal never repeats itself, though: segment ids, pin generations and attempt numbers come from a single sequence (the first segment is 1, and every roll, pin and proposal takes the next number), so a generation or an attempt passed where a segment id goes names no segment. Segment ids still ascend; they aren't consecutive. Give each journal its own scope: `Journal.with_scope(policy, base_offset, now, scope)`, any Integer in `0..65_535` (a non-Integer raises `TypeError`, anything outside the range raises `RangeError`). `Journal.new(policy, base_offset, now)` is scope zero. The scope rides in the top 16 bits of every segment id, pin generation and attempt number (and so of a rewritten segment's `revision`); `journal.scope`, `pin.scope` and `replacement.scope` read it back. A journal that never issued it, of another scope or not that far along, answers `:stale` to a pin or replacement (`nil` from `pin_offset`) and `:unknown` to a segment id (`nil` from `segment`, `[]` from the scans), and changes nothing. The journal can't pick a scope for you, and two journals left in the same scope still mix up each other's handles. `Pin` and `Replacement` objects can't be built by hand.
 - **Refusals don't raise.** `:segments_full`, `:pinned`, `:not_durable`, `:stale` and the rest are answers. A refused call changes nothing. Only malformed input raises.
-- **Repeats aren't refusals, when they can be proved.** `:unchanged` and `:already_durable` mean the journal can see that exactly what you asked for was already done. Treat them as success. They change nothing. A repeat it can't prove is refused: a second `release` is `:stale`, a second confirmation with different contents is `:mismatch`.
+- **Restarts.** A journal built again with `new` or `with_scope` numbers from 1 again, so a pin or replacement that outlived the restart could name a new entry. Either resume the numbering, `Journal.resumed(policy, base_offset, now, scope, issued)` with the `journal.issued` you saved from the journal before it, or give each incarnation its own scope. `resumed` restores the numbering and nothing else: segments and pins are yours to replay, and the one active segment takes the next number. It raises `RangeError` for an `issued` outside `0..2**48-2`. Save `issued` before you hand a number out: resuming from too low a count reissues.
+- **Repeats aren't refusals, when they can be proved.** `:unchanged` and `:already_durable` mean the journal can see that exactly what you asked for was already done. Treat them as success. They change nothing. A repeat it can't prove is refused: a second `release`, `reclaim` or `abort` is `:stale` (it keeps neither the pins it released nor how an attempt ended), a second confirmation with different contents is `:mismatch`.
 - **No pins means no objection.** The journal protects what is pinned. If nobody pinned a checkpoint, nothing stops a durable replacement from being reclaimed.
 - **Frozen means frozen.** `freeze` the journal and every mutating call raises `FrozenError`.
 
@@ -386,7 +387,7 @@ Move the checkpoint pin to the offset your commit actually persisted, not to the
 
 ## What's Yours
 
-Everything that touches a disk. You write the records, seal the files, rewrite the compacted copies, fsync, and delete. The journal keeps metadata in your process and loses it when the process dies. After a restart, rebuild a fresh journal from what's on disk and from your own durable manifest, then re-pin readers and checkpoints before letting the reaper run. A half-finished replacement found on disk after a crash is yours to finish or discard. This is not a log writer, not a byte compactor and not a Raft log. It's an initial release and the API will move.
+Everything that touches a disk. You write the records, seal the files, rewrite the compacted copies, fsync, and delete. The journal keeps metadata in your process and loses it when the process dies. After a restart, rebuild a journal from what's on disk and from your own durable manifest (see Restarts above for its numbering), then re-pin readers and checkpoints before letting the reaper run. A half-finished replacement found on disk after a crash is yours to finish or discard. This is not a log writer, not a byte compactor and not a Raft log. It's an initial release and the API will move.
 
 ## License
 
