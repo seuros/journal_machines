@@ -213,6 +213,28 @@ journal.pin_offset(checkpoint)          # => 8
 
 A consumer that was fenced off can't drag retention forward with an offset it committed before it lost the partition. A newer assignment takes over at whatever offset it reports, even a lower one.
 
+If the generation and the offset come from an offset tracker, hand over the tracker instead of two loose integers:
+
+```ruby
+tracker = OffsetMachines::Tracker.new       # gem 'offset_machines'
+journal.pin_checkpoint_from(tracker)        # => :unassigned, nothing pinned
+
+tracker.assign(3, 20)
+checkpoint = journal.pin_checkpoint_from(tracker)
+journal.pin_offset(checkpoint)              # => 20
+
+tracker.ack(3, 20)                          # acknowledged, not committed
+journal.checkpoint_from(checkpoint, tracker)   # => :unchanged
+tracker.mark_committed(3, 21)
+journal.checkpoint_from(checkpoint, tracker)   # => :advanced, now at 21
+
+zombie = OffsetMachines::Tracker.new
+zombie.assign(2, 99)
+journal.checkpoint_from(checkpoint, zombie)    # => :stale_assignment
+```
+
+`pin_checkpoint_from(tracker)` is `pin_checkpoint(tracker.generation, tracker.base)` and `checkpoint_from(pin, tracker)` is `checkpoint(pin, tracker.generation, tracker.base)`, with the same answers. Both numbers are read from the one object you pass, so they can't come from two different trackers. This gem doesn't depend on `offset_machines`: any object with `generation` and `base` readers fits, `OffsetMachines::Tracker` being the one they were written for. Anything without them raises `TypeError`.
+
 ### Reclaim
 
 ```ruby
@@ -279,7 +301,7 @@ A file you wrote and didn't sync is a promise from the page cache. A file you sy
 ### You Think: "The consumer acknowledged it, so the checkpoint can move."
 ### Reality: Acknowledged is not committed.
 
-Move the checkpoint pin to the offset your commit actually persisted, not to the one a worker says it finished. The Rust core pairs with `offset-machines` for exactly this: it pins at the tracker's confirmed base.
+Move the checkpoint pin to the offset your commit actually persisted, not to the one a worker says it finished. `pin_checkpoint_from` and `checkpoint_from` pair with `offset_machines` for exactly this: they pin at the tracker's confirmed base, never at what was merely acknowledged.
 
 ## What's Yours
 

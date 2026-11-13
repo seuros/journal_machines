@@ -6,6 +6,9 @@ require 'journal_machines'
 class JournalTest < Minitest::Test
   J = JournalMachines
 
+  # Stand-in with the two readers of OffsetMachines::Tracker the journal uses.
+  Tracker = Data.define(:generation, :base)
+
   # A journal with `count` sealed ten-record, hundred-byte segments.
   def journal_with(count, **)
     journal = J::Journal.new(**)
@@ -190,6 +193,39 @@ class JournalTest < Minitest::Test
     assert_equal :reassigned, journal.checkpoint(pin, 2**64 - 1, 2**64 - 1)
   end
 
+  def test_checkpoints_follow_one_tracker
+    journal = J::Journal.new
+    assert_equal :unassigned, journal.pin_checkpoint_from(Tracker.new(0, 5))
+    assert_equal 0, journal.pins
+    pin = journal.pin_checkpoint_from(Tracker.new(3, 20))
+    assert_equal [:checkpoint, 20], [pin.kind, journal.pin_offset(pin)]
+    assert_equal :unchanged, journal.checkpoint_from(pin, Tracker.new(3, 20))
+    assert_equal :advanced, journal.checkpoint_from(pin, Tracker.new(3, 25))
+    assert_equal :regressed, journal.checkpoint_from(pin, Tracker.new(3, 24))
+    assert_equal :unassigned, journal.checkpoint_from(pin, Tracker.new(0, 99))
+    assert_equal :stale_assignment, journal.checkpoint_from(pin, Tracker.new(2, 99))
+    assert_equal 25, journal.pin_offset(pin)
+    assert_equal :reassigned, journal.checkpoint_from(pin, Tracker.new(4, 8))
+    assert_equal :stale_assignment, journal.checkpoint(pin, 3, 30)
+    assert_equal 8, journal.pin_offset(pin)
+    assert_equal :wrong_kind, journal.checkpoint_from(journal.pin_reader(0), Tracker.new(4, 9))
+    assert_equal :stale, J::Journal.new.checkpoint_from(pin, Tracker.new(4, 9))
+  end
+
+  def test_tracker_must_have_the_readers
+    journal = J::Journal.new
+    pin = journal.pin_checkpoint(1, 0)
+    [nil, 7, Object.new, Data.define(:generation).new(1), Data.define(:base).new(1)].each do |v|
+      assert_raises(TypeError) { journal.pin_checkpoint_from(v) }
+      assert_raises(TypeError) { journal.checkpoint_from(pin, v) }
+    end
+    assert_raises(TypeError) { journal.pin_checkpoint_from(Tracker.new(1.0, 0)) }
+    assert_raises(TypeError) { journal.checkpoint_from(pin, Tracker.new(1, nil)) }
+    assert_raises(RangeError) { journal.pin_checkpoint_from(Tracker.new(1, -1)) }
+    assert_raises(TypeError) { journal.checkpoint_from(Object.new, Tracker.new(1, 5)) }
+    assert_equal [1, 0], [journal.pins, journal.pin_offset(pin)]
+  end
+
   def test_pin_capacity
     journal = J::Journal.new
     pins = 32.times.map { journal.pin_reader(it) }
@@ -209,6 +245,7 @@ class JournalTest < Minitest::Test
     assert_equal :stale, b.release(pin)
     assert_equal :stale, b.advance(pin, 5)
     assert_equal :stale, b.checkpoint(pin, 1, 5)
+    assert_equal :stale, b.checkpoint_from(pin, Tracker.new(1, 5))
     assert_nil b.pin_offset(pin)
     assert_equal :stale, b.confirm_superseded(replacement)
     assert_equal :stale, b.confirm_rewritten(replacement, 1, 1)
@@ -262,6 +299,8 @@ class JournalTest < Minitest::Test
     assert_raises(FrozenError) { journal.pin_checkpoint(1, 0) }
     assert_raises(FrozenError) { journal.advance(pin, 1) }
     assert_raises(FrozenError) { journal.checkpoint(pin, 1, 1) }
+    assert_raises(FrozenError) { journal.pin_checkpoint_from(Tracker.new(1, 0)) }
+    assert_raises(FrozenError) { journal.checkpoint_from(pin, Tracker.new(1, 1)) }
     assert_raises(FrozenError) { journal.release(pin) }
     assert_raises(FrozenError) { journal.propose(1) }
     assert_raises(FrozenError) { journal.confirm_superseded(replacement) }

@@ -56,8 +56,24 @@ module JournalMachines
       reclaimed.is_a?(Symbol) ? reclaimed : Reclaimed.new(*reclaimed)
     end
 
+    # Pin a checkpoint at a tracker's confirmed-committed base, under its
+    # assignment generation. Both come from the one tracker passed.
+    def pin_checkpoint_from(tracker) = pin_checkpoint(*checkpoint_source(tracker))
+
+    # Move a checkpoint pin to a tracker's confirmed-committed base.
+    def checkpoint_from(pin, tracker) = checkpoint(pin, *checkpoint_source(tracker))
+
     private
 
     def wrap(row) = row && Segment.new(*row)
+
+    # Assignment generation and committed base of one offset tracker.
+    def checkpoint_source(tracker)
+      unless tracker.respond_to?(:generation) && tracker.respond_to?(:base)
+        raise TypeError, 'expected an offset tracker responding to #generation and #base'
+      end
+
+      [tracker.generation, tracker.base]
+    end
   end
 end

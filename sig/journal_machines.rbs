@@ -8,6 +8,10 @@ module JournalMachines
   type pin_refusal = :full | :unassigned | :exhausted
   type pin_update = :advanced | :unchanged | :reassigned | :stale | :regressed | :stale_assignment | :unassigned | :wrong_kind
   type confirm_result = :confirmed | :already_durable | :invalid | :stale
+  interface _Tracker
+    def generation: () -> Integer
+    def base: () -> Integer
+  end
   class Pin
     def kind: () -> (:reader | :checkpoint)
   end
@@ -56,8 +60,10 @@ module JournalMachines
     def reclaimable: (?Integer? after, ?Integer limit) -> Array[Segment]
     def pin_reader: (Integer offset) -> (Pin | pin_refusal)
     def pin_checkpoint: (Integer assignment, Integer offset) -> (Pin | pin_refusal)
+    def pin_checkpoint_from: (_Tracker tracker) -> (Pin | pin_refusal)
     def advance: (Pin, Integer offset) -> pin_update
     def checkpoint: (Pin, Integer assignment, Integer offset) -> pin_update
+    def checkpoint_from: (Pin, _Tracker tracker) -> pin_update
     def release: (Pin) -> (:released | :stale)
     def pin_offset: (Pin) -> Integer?
     def low_pin: () -> Integer?
@@ -67,5 +73,10 @@ module JournalMachines
     def confirm_superseded: (Replacement) -> confirm_result
     def reclaim: (Replacement) -> (Reclaimed | :stale | :not_durable | :pinned)
     def abort: (Replacement) -> (:aborted | :stale)
+
+    private
+
+    def wrap: (Array[untyped]? row) -> Segment?
+    def checkpoint_source: (_Tracker tracker) -> [Integer, Integer]
   end
 end

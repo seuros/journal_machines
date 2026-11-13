@@ -36,7 +36,10 @@ PINS>` has compile-time capacities and refuses rather than grows.
 
 Checkpoint pins compose with `offset-machines`: `pin_checkpoint_from(&tracker)`
 and `checkpoint_from(pin, &tracker)` pin at the tracker's confirmed-committed
-base under its assignment generation, never at merely acknowledged offsets.
+base under its assignment generation, never at merely acknowledged offsets. An
+unassigned tracker is refused as `Unassigned`, an older assignment as
+`StaleAssignment`. The Ruby gem offers the same two calls over any object
+with `generation` and `base` readers, such as `OffsetMachines::Tracker`.
 
 Durability is the caller's claim; the journal cannot check it. Filesystem
 operations, crash recovery and rebuilding this metadata after a restart stay
