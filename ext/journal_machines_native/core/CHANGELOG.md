@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/seuros/journal_machines/compare/journal-machines-v0.4.0...journal-machines-v0.5.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* handles are issued through periscope-machines. Every instance can be built with a scope; a handle from another scope is refused before any lookup; all handle kinds of an instance share one sequence; resumed restores the sequence after a restart. Handles of a journal no longer share raw values; release of a pin that is not held is Stale; the Ruby owner tag is gone.
+
+### Features
+
+* draw segment ids, pin generations and attempts from one scoped periscope sequence; add Journal::resumed ([6a9b959](https://github.com/seuros/journal_machines/commit/6a9b9597aceffa452dee5d74903f99b184a15d2e))
+
 ## [0.4.0](https://github.com/seuros/journal_machines/compare/journal-machines-v0.3.0...journal-machines-v0.4.0) (2026-11-13)
 
 
