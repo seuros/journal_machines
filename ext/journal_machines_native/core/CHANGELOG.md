@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/seuros/journal_machines/compare/journal-machines-v0.3.0...journal-machines-v0.4.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* see CONVENTIONS: one exhaustive Refusal per crate, Result from every mutator, honoured idempotent repeats only when provable, Duration time, Ruby mirrors the core. No compatibility aliases. Requires offset-machines >= 0.3. A repeated confirm with another payload is Mismatch; releasing a pin that is not held is Stale.
+
+### Features
+
+* one Refusal enum with Result everywhere, provable repeats only, Duration time, Ruby Policy and _from pin calls ([f820899](https://github.com/seuros/journal_machines/commit/f8208990722b8407f206f8714c5708720f72dc74))
+
 ## [0.3.0](https://github.com/seuros/journal_machines/compare/journal-machines-v0.2.0...journal-machines-v0.3.0) (2026-11-13)
 
 
