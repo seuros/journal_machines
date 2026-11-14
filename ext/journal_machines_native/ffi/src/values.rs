@@ -1,9 +1,9 @@
 //! Private hooks the Ruby `Data` values validate with: each builds the core
 //! value and raises where the core's constructor answers `None`.
 use journal_machines::{Reclaimed, Rolled, Segment, SegmentId};
-use magnus::{Error, Ruby, Value, prelude::*};
+use magnus::{Error, Ruby, Value};
 use matryona_machines::ruby::{
-    Symbols, boolean, duration, exact_array_n, exact_typed, integer, optional,
+    Symbols, boolean, duration, exact_array_n, integer, optional, optional_typed,
 };
 
 use crate::{
@@ -77,17 +77,8 @@ pub fn check_segment(
     let (bytes, opened_at) = (integer(bytes, "bytes")?, duration(opened_at, "opened_at")?);
     // After the Integers, as when magnus converted the arguments in order.
     let class = classes(ruby)?.replacement.get(ruby);
-    let replacement = if replacement.is_nil() {
-        None
-    } else {
-        let message = "replacement must be a JournalMachines::Replacement or nil";
-        Some(exact_typed::<ReplacementHandle>(
-            ruby,
-            replacement,
-            class,
-            message,
-        )?)
-    };
+    let message = "replacement must be a JournalMachines::Replacement or nil";
+    let replacement = optional_typed::<ReplacementHandle>(ruby, replacement, class, message)?;
     Segment::new(
         id,
         revision,
