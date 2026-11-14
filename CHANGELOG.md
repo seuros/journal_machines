@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0](https://github.com/seuros/journal_machines/compare/journal_machines/v0.5.0...journal_machines/v0.6.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* adopt matryona 0.3: optional_positive, integer_in and boolean readers, names_only refusal table
+
+### Features
+
+* adopt matryona 0.3: optional_positive, integer_in and boolean readers, names_only refusal table ([ab0f05d](https://github.com/seuros/journal_machines/commit/ab0f05dc11b473e24308f7696af71be55674ee11))
+
 ## [0.5.0](https://github.com/seuros/journal_machines/compare/journal_machines/v0.4.0...journal_machines/v0.5.0) (2026-11-14)
 
 
