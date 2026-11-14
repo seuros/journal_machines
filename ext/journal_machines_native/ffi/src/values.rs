@@ -2,27 +2,15 @@
 //! value and raises where the core's constructor answers `None`.
 use journal_machines::{Reclaimed, Rolled, Segment, SegmentId};
 use magnus::{Error, Ruby, Value, prelude::*};
-use matryona_machines::ruby::{Symbols, duration, exact_array_n, exact_typed, integer, optional};
+use matryona_machines::ruby::{
+    Symbols, boolean, duration, exact_array_n, exact_typed, integer, optional,
+};
 
 use crate::{
     ReplacementHandle,
     answers::{Reasons, States},
     classes::classes,
 };
-
-/// `true` or `false`; `TypeError` for anything else, `nil` included.
-fn flag(ruby: &Ruby, value: Value) -> Result<bool, Error> {
-    if value.is_kind_of(ruby.class_true_class()) {
-        Ok(true)
-    } else if value.is_kind_of(ruby.class_false_class()) {
-        Ok(false)
-    } else {
-        Err(Error::new(
-            ruby.exception_type_error(),
-            "expected true or false",
-        ))
-    }
-}
 
 fn range(ruby: &Ruby, message: &'static str) -> Error {
     Error::new(ruby.exception_range_error(), message)
@@ -110,7 +98,7 @@ pub fn check_segment(
         bytes,
         opened_at,
         States::parse(ruby, state_name)?,
-        flag(ruby, pinned)?,
+        boolean(pinned, "pinned")?,
         replacement.map(|handle| handle.replacement),
     )
     .map(drop)

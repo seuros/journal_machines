@@ -2,9 +2,9 @@
 //! core returned with the classes resolved at init.
 use journal_machines::{Reclaimed, Refusal, RollReason, Rolled, Segment, SegmentState};
 use magnus::{Error, IntoValue, RClass, Ruby, Value, prelude::*};
-use matryona_machines::ruby::{Symbols, nanoseconds, symbol};
+use matryona_machines::ruby::{SymbolNames, Symbols, nanoseconds};
 
-use crate::{ReplacementHandle, convert::refusal};
+use crate::{ReplacementHandle, convert::Refusals};
 
 /// The refusal's symbol, or what `build` makes of the honoured answer.
 pub fn reply<T>(
@@ -12,7 +12,10 @@ pub fn reply<T>(
     outcome: Result<T, Refusal>,
     build: impl FnOnce(T) -> Result<Value, Error>,
 ) -> Result<Value, Error> {
-    outcome.map_or_else(|error| Ok(symbol(ruby, refusal(error)).as_value()), build)
+    outcome.map_or_else(
+        |refusal| Ok(Refusals::symbol(ruby, &refusal).as_value()),
+        build,
+    )
 }
 
 matryona_machines::symbols! {

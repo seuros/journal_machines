@@ -36,6 +36,16 @@ class JournalTest < Minitest::Test
     assert_raises(NoMethodError) { J::Journal.__check_policy(nil, nil, nil, 0) }
   end
 
+  def test_a_policy_ratio_is_an_integer_in_zero_to_a_thousand
+    [1001, 2**16, -1].each do |ratio|
+      error = assert_raises(RangeError) { J::Policy.new(nil, nil, nil, ratio) }
+      assert_equal 'min_dead_per_mille must be in 0..=1000', error.message
+    end
+    assert_equal 1000, J::Policy.new(nil, nil, nil, 1000).min_dead_per_mille
+    error = assert_raises(RangeError) { J::Policy.new(nil, nil, 0, 0) }
+    assert_equal 'max_age must be in 1..=18446744073709551615', error.message
+  end
+
   def test_roll_decision_from_observations
     journal = open_journal(now: 1000, max_bytes: 100, max_records: 10, max_age: 50)
     assert_equal :keep, journal.roll_decision(99, 9, 1049)

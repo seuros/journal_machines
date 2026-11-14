@@ -63,6 +63,14 @@ class ValuesTest < Minitest::Test
     assert_raises(RangeError) { active.with(records: 1) }
   end
 
+  def test_pinned_is_exactly_true_or_false
+    active = open_journal.active
+    [nil, 0, 'true', :true].each do |flag|
+      error = assert_raises(TypeError, flag.inspect) { J::Segment.new(**active.to_h, pinned: flag) }
+      assert_equal 'pinned must be true or false', error.message
+    end
+  end
+
   def test_a_cursor_is_an_identity_this_journal_issued
     journal, = journal_with(3)
     assert_equal [2, 3, 4], journal.segments(1, 10).map(&:id)

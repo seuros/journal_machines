@@ -96,9 +96,9 @@ impl Journal {
     /// Raises where `Policy::new` answers `None`; `Policy.new` calls it.
     fn check_policy(
         ruby: &Ruby,
-        max_bytes: Option<Value>,
-        max_records: Option<Value>,
-        max_age: Option<Value>,
+        max_bytes: Value,
+        max_records: Value,
+        max_age: Value,
         min_dead_per_mille: Value,
     ) -> Result<(), Error> {
         policy(ruby, max_bytes, max_records, max_age, min_dead_per_mille).map(drop)
