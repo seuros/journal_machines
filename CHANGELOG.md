@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/seuros/journal_machines/compare/journal_machines/v0.3.0...journal_machines/v0.4.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* validate values through the core, value handles, native answers, read Policy by exact class, clone-then-keep roll/reclaim
+
+### Features
+
+* validate values through the core, value handles, native answers, read Policy by exact class, clone-then-keep roll/reclaim ([5b00d40](https://github.com/seuros/journal_machines/commit/5b00d406d92bdfb6f1ec331b60c61243ec013994))
+
 ## [0.3.0](https://github.com/seuros/journal_machines/compare/journal_machines/v0.2.0...journal_machines/v0.3.0) (2026-11-13)
 
 
