@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/seuros/journal_machines/compare/journal_machines/v0.6.0...journal_machines/v0.6.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* **deps:** require matryona-machines &gt;= 0.4 and read the Segment replacement with optional_typed ([f318c31](https://github.com/seuros/journal_machines/commit/f318c317503a121503ce9865fd51f0289e6398c0))
+
 ## [0.6.0](https://github.com/seuros/journal_machines/compare/journal_machines/v0.5.0...journal_machines/v0.6.0) (2026-11-14)
 
 
