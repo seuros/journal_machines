@@ -44,13 +44,6 @@ class RefusalsTest < Minitest::Test
     assert_nil journal.segment(2)
   end
 
-  # Everything a caller can read back from a journal. Replacement handles are
-  # fresh objects on every read, so they are compared by what they name.
-  def snapshot(journal, pins)
-    rows = journal.segments(nil, 64).map { |s| [*s.to_h.except(:replacement).values, s.replacement&.attempt] }
-    [journal.size, rows, journal.pins, journal.low_pin, pins.map { journal.pin_offset(it) }]
-  end
-
   def test_every_refusal_and_repeat_is_a_symbol_and_changes_nothing
     journal = open_journal(now: 5)
     3.times { journal.roll(100, 10, 5) }

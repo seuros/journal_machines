@@ -21,11 +21,7 @@ class ScopeTest < Minitest::Test
     Issued.new(journal, sealed[0], reader, checkpoint, released, proposed, durable)
   end
 
-  def snapshot(issued)
-    journal = issued.journal
-    rows = journal.segments(nil, 64).map { |s| [*s.to_h.except(:replacement).values, s.replacement&.attempt] }
-    [rows, journal.pins, journal.low_pin, journal.pin_offset(issued.reader), journal.pin_offset(issued.checkpoint)]
-  end
+  def snapshot_of(issued) = snapshot(issued.journal, [issued.reader, issued.checkpoint])
 
   def test_new_is_scope_zero_and_issues_one_plain_counter
     zero = issued(nil)
@@ -48,12 +44,12 @@ class ScopeTest < Minitest::Test
                *[all.proposed, all.durable].map(&:attempt)]
     assert_equal numbers.uniq, numbers
     assert_equal [3], numbers.map { it >> 48 }.uniq
-    before = snapshot(all)
+    before = snapshot_of(all)
     [all.proposed.attempt, all.durable.attempt, all.reader.generation].each do |number|
       assert_nil journal.segment(number)
       assert_equal %i[unknown unknown], [journal.propose(number), journal.observe_live(number, 0)]
     end
-    assert_equal before, snapshot(all)
+    assert_equal before, snapshot_of(all)
   end
 
   def test_with_scope_stamps_every_identity
@@ -71,7 +67,7 @@ class ScopeTest < Minitest::Test
     near = issued(1)
     far = issued(2)
     [[near, far], [far, near]].each do |own, other|
-      before = snapshot(own)
+      before = snapshot_of(own)
       assert_equal [:stale], foreign_pin_answers(own.journal, other).uniq
       assert_equal [:stale], foreign_replacement_answers(own.journal, other).uniq
       assert_nil own.journal.pin_offset(other.reader)
@@ -79,7 +75,7 @@ class ScopeTest < Minitest::Test
       assert_equal %i[unknown unknown], [own.journal.observe_live(other.sealed, 1), own.journal.propose(other.sealed)]
       scans = %i[segments compaction_candidates reclaimable].map { own.journal.public_send(it, other.sealed, 64) }
       assert_equal [[], [], []], scans
-      assert_equal before, snapshot(own)
+      assert_equal before, snapshot_of(own)
     end
     assert_equal :unchanged, near.journal.advance(near.reader, 30)
     assert_equal %i[stale released], [near.journal.release(near.released), near.journal.release(near.reader)]

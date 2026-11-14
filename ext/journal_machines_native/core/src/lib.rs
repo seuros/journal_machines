@@ -1,15 +1,18 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
 
+mod checked;
 mod pins;
 mod policy;
 mod refusal;
 mod replace;
+mod segment;
 
 pub use pins::{Advanced, Checkpointed, Pin, PinKind};
 pub use policy::{Policy, RollReason};
 pub use refusal::Refusal;
 pub use replace::{Confirmed, Durable, Reclaimed, Replacement};
+pub use segment::{Roll, Rolled, Segment, SegmentState};
 
 use core::time::Duration;
 
@@ -45,76 +48,6 @@ impl SegmentId {
     pub const fn scope(self) -> u16 {
         scope_of(self.0)
     }
-}
-
-/// Where a segment stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SegmentState {
-    /// The tail segment still being written.
-    Active,
-    /// Closed, with no replacement in flight.
-    Sealed,
-    /// A replacement is being built.
-    Proposed,
-    /// The replacement is confirmed durable, but a pin still retains the original.
-    Durable,
-    /// The replacement is durable and no pin retains the original.
-    Reclaimable,
-}
-
-/// Point-in-time view of one segment's metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Segment {
-    /// Segment identity.
-    pub id: SegmentId,
-    /// Zero for the original file, otherwise the attempt that rewrote it.
-    pub revision: u64,
-    /// First offset of the range.
-    pub base_offset: u64,
-    /// Offsets in the range; zero while active.
-    pub records: u64,
-    /// Records physically held by the current revision.
-    pub stored_records: u64,
-    /// Records the caller last reported as still live.
-    pub live_records: u64,
-    /// Byte size of the current revision; zero while active.
-    pub bytes: u64,
-    /// When the segment was opened, on the caller's monotonic clock.
-    pub opened_at: Duration,
-    /// Lifecycle state.
-    pub state: SegmentState,
-    /// Whether any pin retains part of the range; always false while active.
-    pub pinned: bool,
-    /// The replacement attempt in flight, if any.
-    pub replacement: Option<Replacement>,
-}
-
-impl Segment {
-    /// One past the last offset of the range.
-    #[must_use]
-    pub const fn end_offset(&self) -> u64 {
-        self.base_offset + self.records
-    }
-}
-
-/// Answer of [`Journal::roll_decision`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Roll {
-    /// Keep writing to the active segment.
-    Keep,
-    /// A threshold was reached.
-    Due(RollReason),
-}
-
-/// A recorded roll.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rolled {
-    /// The segment that was sealed.
-    pub sealed: SegmentId,
-    /// The new active segment.
-    pub opened: SegmentId,
-    /// First offset of the new active segment.
-    pub next_offset: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,17 +234,14 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// One segment's metadata; `None` for an identity of another scope.
     #[must_use]
     pub fn segment(&self, id: SegmentId) -> Option<Segment> {
-        let slot = self.slots[self.index_of(id)?]?;
-        Some(self.view(&slot))
+        self.find(id).map(|slot| self.view(&slot))
     }
 
     /// The segment whose range holds `offset`. The active segment answers
     /// for every offset at or after its base.
     #[must_use]
     pub fn covering(&self, offset: u64) -> Option<Segment> {
-        self.slots[..self.len]
-            .iter()
-            .flatten()
+        self.tracked()
             .find(|slot| {
                 offset >= slot.base && (slot.phase == Phase::Active || offset < slot.end())
             })
@@ -319,8 +249,15 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     }
 
     /// Every segment after `after` in ascending identity order. Resume by
-    /// passing the last identity yielded. An `after` of another scope is no
-    /// position in this journal: the iterator is empty.
+    /// passing the last identity yielded.
+    ///
+    /// `after` is an identity this journal issued: one it never issued (of
+    /// another scope, a zero sequence, or one not reached) is no position in
+    /// this journal, and the iterator is empty. `None` is the one way to
+    /// begin. An issued identity is a position whether or not it still names
+    /// a segment, so resuming after a segment that has since left the journal
+    /// works, and so does any pin generation or attempt: all three come from
+    /// the one sequence that orders segment ids.
     #[must_use]
     pub fn segments(&self, after: Option<SegmentId>) -> Segments<'_, SEGMENTS, PINS> {
         self.scan(after, Filter::All)
@@ -379,20 +316,23 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
             return Err(Refusal::TimeRegression);
         }
         let next_offset = sealed.base.checked_add(records).ok_or(Refusal::Overflow)?;
-        if self.len == SEGMENTS {
+        // The active slot and the one after it; a full journal has no second.
+        let Some([active, next]) = self
+            .len
+            .checked_sub(1)
+            .and_then(|last| self.slots.get_mut(last..))
+            .and_then(<[_]>::first_chunk_mut)
+        else {
             return Err(Refusal::SegmentsFull);
-        }
-        let opened = match self.issuer.issue() {
-            Ok(opened) => opened,
-            Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
         };
+        let opened = self.issuer.issue()?;
         sealed.span = records;
         sealed.stored = records;
         sealed.live = records;
         sealed.bytes = bytes;
         sealed.phase = Phase::Sealed;
-        self.slots[self.len - 1] = Some(sealed);
-        self.slots[self.len] = Some(Slot::active(opened, next_offset, now));
+        *active = Some(sealed);
+        *next = Some(Slot::active(opened, next_offset, now));
         self.len += 1;
         Ok(Rolled {
             sealed: SegmentId(sealed.id),
@@ -407,10 +347,7 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// [`Refusal::Unknown`] (which includes an identity of another scope),
     /// [`Refusal::Active`] or [`Refusal::Exceeds`]; a refusal changes nothing.
     pub fn observe_live(&mut self, id: SegmentId, live_records: u64) -> Result<(), Refusal> {
-        let slot = self
-            .index_of(id)
-            .and_then(|index| self.slots[index].as_mut())
-            .ok_or(Refusal::Unknown)?;
+        let (_, slot) = self.find_mut(id).ok_or(Refusal::Unknown)?;
         if slot.phase == Phase::Active {
             return Err(Refusal::Active);
         }
@@ -421,20 +358,30 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
         Ok(())
     }
 
-    /// An identity this journal never issued, of another scope or not yet
-    /// reached, names nothing here: no slot is read.
-    pub(crate) fn index_of(&self, id: SegmentId) -> Option<usize> {
+    /// The tracked segments, in slot order.
+    pub(crate) fn tracked(&self) -> impl Iterator<Item = &Slot> {
+        self.slots.iter().take(self.len).flatten()
+    }
+
+    /// A copy of the segment `id` names. An identity this journal never
+    /// issued, of another scope or not yet reached, names nothing here: no
+    /// slot is read.
+    pub(crate) fn find(&self, id: SegmentId) -> Option<Slot> {
         if !self.issuer.owns(id.0) {
             return None;
         }
-        self.slots[..self.len]
-            .iter()
-            .position(|slot| slot.is_some_and(|slot| slot.id == id.0))
+        self.tracked().find(|slot| slot.id == id.0).copied()
+    }
+
+    /// The slot index and the segment `id` names, as [`Journal::find`].
+    pub(crate) fn find_mut(&mut self, id: SegmentId) -> Option<(usize, &mut Slot)> {
+        locate(&self.issuer, &mut self.slots, self.len, id)
     }
 
     fn active_slot(&self) -> Option<Slot> {
-        let last = self.slots[..self.len].last().copied().flatten()?;
-        (last.phase == Phase::Active).then_some(last)
+        let last = self.len.checked_sub(1)?;
+        let slot = self.slots.get(last).copied().flatten()?;
+        (slot.phase == Phase::Active).then_some(slot)
     }
 
     fn view(&self, slot: &Slot) -> Segment {
@@ -469,9 +416,11 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     fn scan(&self, after: Option<SegmentId>, filter: Filter) -> Segments<'_, SEGMENTS, PINS> {
         let index = match after {
             None => 0,
-            Some(after) if after.scope() != self.scope() => self.len,
-            Some(after) => self.slots[..self.len]
+            Some(after) if !self.issuer.owns(after.0) => self.len,
+            Some(after) => self
+                .slots
                 .iter()
+                .take(self.len)
                 .position(|slot| slot.is_some_and(|slot| slot.id > after.0))
                 .unwrap_or(self.len),
         };
@@ -481,6 +430,29 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
             filter,
         }
     }
+}
+
+/// The slot index and the segment `id` names among the first `len` of
+/// `slots`, borrowing only `slots` so the caller may still issue from
+/// `issuer`. An identity `issuer` never issued names nothing: no slot is read.
+fn locate<'a>(
+    issuer: &Issuer,
+    slots: &'a mut [Option<Slot>],
+    len: usize,
+    id: SegmentId,
+) -> Option<(usize, &'a mut Slot)> {
+    if !issuer.owns(id.0) {
+        return None;
+    }
+    slots
+        .iter_mut()
+        .take(len)
+        .enumerate()
+        .find_map(|(index, slot)| {
+            slot.as_mut()
+                .filter(|slot| slot.id == id.0)
+                .map(|slot| (index, slot))
+        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -503,7 +475,7 @@ impl<const SEGMENTS: usize, const PINS: usize> Iterator for Segments<'_, SEGMENT
 
     fn next(&mut self) -> Option<Segment> {
         while self.index < self.journal.len {
-            let slot = self.journal.slots[self.index];
+            let slot = self.journal.slots.get(self.index).copied().flatten();
             self.index += 1;
             let Some(view) = slot.map(|slot| self.journal.view(&slot)) else {
                 continue;

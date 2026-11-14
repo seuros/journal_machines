@@ -1,63 +1,33 @@
 //! Thin binding to the bounded segment metadata journal.
+mod answers;
+mod classes;
 mod convert;
+mod handles;
 mod init;
+mod values;
 
-use convert::{Number, Scope, answer, nanos, policy, refusal};
+use answers::reply;
+use classes::{classes, keep};
+use convert::{Number, Scope, answer, nanos, policy, policy_from};
+use handles::{PinHandle, ReplacementHandle};
 
 use std::{cell::RefCell, num::NonZeroU64};
 
 use journal_machines::{
-    Advanced, Checkpointed, Confirmed, Durable, Pin, PinKind, Refusal, Replacement, Roll,
-    RollReason, Segment, SegmentId, SegmentState,
+    Advanced, Checkpointed, Confirmed, Durable, Pin, Refusal, Roll, Segment, SegmentId,
 };
 use magnus::{Error, IntoValue, RArray, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
 
-/// The four `Policy` fields as Ruby passes them, in order.
-type Thresholds = (Option<Number>, Option<Number>, Option<Number>, Number);
-
 const SEGMENTS: usize = 64;
+
+/// Which of the core's three segment iterators a scan reads.
+#[derive(Clone, Copy)]
+enum Scan {
+    All,
+    Candidates,
+    Reclaimable,
+}
 const PINS: usize = 32;
-
-#[magnus::wrap(class = "JournalMachines::Pin", free_immediately, size)]
-struct PinHandle {
-    pin: Pin,
-}
-
-impl PinHandle {
-    fn kind(ruby: &Ruby, this: &Self) -> Symbol {
-        ruby.to_symbol(match this.pin.kind() {
-            PinKind::Reader => "reader",
-            PinKind::Checkpoint => "checkpoint",
-        })
-    }
-
-    const fn generation(&self) -> u64 {
-        self.pin.generation()
-    }
-
-    const fn scope(&self) -> u16 {
-        self.pin.scope()
-    }
-}
-
-#[magnus::wrap(class = "JournalMachines::Replacement", free_immediately, size)]
-struct ReplacementHandle {
-    replacement: Replacement,
-}
-
-impl ReplacementHandle {
-    const fn segment(&self) -> u64 {
-        self.replacement.segment().raw()
-    }
-
-    const fn attempt(&self) -> u64 {
-        self.replacement.attempt()
-    }
-
-    const fn scope(&self) -> u16 {
-        self.replacement.scope()
-    }
-}
 
 #[magnus::wrap(class = "JournalMachines::Journal", free_immediately, size)]
 struct Journal {
@@ -72,9 +42,9 @@ impl Journal {
         base_offset: Number,
         now: Number,
         (scope, issued): (Scope, Number),
-        (max_bytes, max_records, max_age, min_dead_per_mille): Thresholds,
+        policy: Value,
     ) -> Result<Self, Error> {
-        let policy = policy(ruby, max_bytes, max_records, max_age, min_dead_per_mille)?;
+        let policy = policy_from(ruby, policy)?;
         let (base, now) = (base_offset.0, now.nanos());
         journal_machines::Journal::resumed(policy, base, now, scope.0, issued.0)
             .map(|core| Self {
@@ -126,23 +96,22 @@ impl Journal {
         self.core.borrow().is_empty()
     }
 
+    /// `:keep`, a `Due` naming the threshold reached, or a refusal.
     fn roll_decision(
         ruby: &Ruby,
         this: &Self,
         bytes: Number,
         records: Number,
         now: Number,
-    ) -> Symbol {
+    ) -> Result<Value, Error> {
+        let due = classes(ruby)?.due;
         let decision = this
             .core
             .borrow()
             .roll_decision(bytes.0, records.0, now.nanos());
-        ruby.to_symbol(match decision {
-            Ok(Roll::Due(RollReason::Size)) => "size",
-            Ok(Roll::Due(RollReason::Records)) => "records",
-            Ok(Roll::Due(RollReason::Age)) => "age",
-            Ok(Roll::Keep) => "keep",
-            Err(error) => refusal(error),
+        reply(ruby, decision, |roll| match roll {
+            Roll::Keep => Ok(ruby.to_symbol("keep").as_value()),
+            Roll::Due(reason) => due.funcall("new", (ruby.to_symbol(answers::reason(reason)),)),
         })
     }
 
@@ -153,13 +122,10 @@ impl Journal {
         records: Number,
         now: Number,
     ) -> Result<Value, Error> {
-        this.check_frozen()?;
-        let rolled = this.core.borrow_mut().roll(bytes.0, records.0, now.nanos());
-        Ok(match rolled {
-            Ok(rolled) => {
-                (rolled.sealed.raw(), rolled.opened.raw(), rolled.next_offset).into_value_with(ruby)
-            }
-            Err(error) => ruby.to_symbol(refusal(error)).as_value(),
+        let class = classes(ruby)?.rolled;
+        keep(ruby, this.as_value(), &this.core, |core| {
+            let rolled = core.roll(bytes.0, records.0, now.nanos());
+            reply(ruby, rolled, |rolled| answers::rolled(class, rolled))
         })
     }
 
@@ -174,90 +140,97 @@ impl Journal {
             .core
             .borrow_mut()
             .observe_live(SegmentId::from_raw(id.0), live.0);
-        Ok(answer(ruby, outcome, "recorded"))
+        Ok(answer(ruby, outcome, |()| "recorded"))
     }
 
-    fn row(ruby: &Ruby, segment: Segment) -> Result<RArray, Error> {
-        let row = ruby.ary_new_capa(11);
-        row.push(segment.id.raw())?;
-        row.push(segment.revision)?;
-        row.push(segment.base_offset)?;
-        row.push(segment.records)?;
-        row.push(segment.stored_records)?;
-        row.push(segment.live_records)?;
-        row.push(segment.bytes)?;
-        row.push(nanos(segment.opened_at))?;
-        row.push(ruby.to_symbol(match segment.state {
-            SegmentState::Active => "active",
-            SegmentState::Sealed => "sealed",
-            SegmentState::Proposed => "proposed",
-            SegmentState::Durable => "durable",
-            SegmentState::Reclaimable => "reclaimable",
-        }))?;
-        row.push(segment.pinned)?;
-        row.push(
-            segment
-                .replacement
-                .map(|replacement| ReplacementHandle { replacement }),
-        )?;
-        Ok(row)
+    /// One read of the journal answered as a `Segment` or `nil`.
+    fn view(
+        ruby: &Ruby,
+        this: &Self,
+        read: impl FnOnce(&journal_machines::Journal<SEGMENTS, PINS>) -> Option<Segment>,
+    ) -> Result<Option<Value>, Error> {
+        let class = classes(ruby)?.segment;
+        let segment = read(&this.core.borrow());
+        segment
+            .map(|segment| answers::segment(ruby, class, segment))
+            .transpose()
     }
 
-    fn optional(ruby: &Ruby, segment: Option<Segment>) -> Result<Option<RArray>, Error> {
-        segment.map(|segment| Self::row(ruby, segment)).transpose()
+    fn active(ruby: &Ruby, this: &Self) -> Result<Option<Value>, Error> {
+        Self::view(ruby, this, journal_machines::Journal::active)
     }
 
-    fn active(ruby: &Ruby, this: &Self) -> Result<Option<RArray>, Error> {
-        let segment = this.core.borrow().active();
-        Self::optional(ruby, segment)
+    fn segment(ruby: &Ruby, this: &Self, id: Number) -> Result<Option<Value>, Error> {
+        Self::view(ruby, this, |core| core.segment(SegmentId::from_raw(id.0)))
     }
 
-    fn segment(ruby: &Ruby, this: &Self, id: Number) -> Result<Option<RArray>, Error> {
-        let segment = this.core.borrow().segment(SegmentId::from_raw(id.0));
-        Self::optional(ruby, segment)
+    fn covering(ruby: &Ruby, this: &Self, offset: Number) -> Result<Option<Value>, Error> {
+        Self::view(ruby, this, |core| core.covering(offset.0))
     }
 
-    fn covering(ruby: &Ruby, this: &Self, offset: Number) -> Result<Option<RArray>, Error> {
-        let segment = this.core.borrow().covering(offset.0);
-        Self::optional(ruby, segment)
-    }
-
-    /// At most `limit` rows (clamped to the capacity) after segment `after`.
-    /// `which` is one of the three private selectors the Ruby side passes.
+    /// At most `limit` rows (clamped to the capacity) of one scan after
+    /// segment `after`. The views are read into a Rust buffer first, so no
+    /// Ruby value is built while the journal is borrowed.
     fn scan(
         ruby: &Ruby,
         this: &Self,
-        which: Symbol,
         after: Option<Number>,
         limit: Number,
+        scan: Scan,
     ) -> Result<RArray, Error> {
         let take = usize::try_from(limit.0).map_or(SEGMENTS, |limit| limit.min(SEGMENTS));
         let after = after.map(|after| SegmentId::from_raw(after.0));
-        let core = this.core.borrow();
-        let segments = match which.name()?.as_ref() {
-            "all" => core.segments(after),
-            "candidates" => core.compaction_candidates(after),
-            "reclaimable" => core.reclaimable(after),
-            _ => return Err(Error::new(ruby.exception_arg_error(), "unknown scan")),
+        let class = classes(ruby)?.segment;
+        let views: Vec<Segment> = {
+            let core = this.core.borrow();
+            match scan {
+                Scan::All => core.segments(after).take(take).collect(),
+                Scan::Candidates => core.compaction_candidates(after).take(take).collect(),
+                Scan::Reclaimable => core.reclaimable(after).take(take).collect(),
+            }
         };
-        let rows = ruby.ary_new_capa(take);
-        for segment in segments.take(take) {
-            rows.push(Self::row(ruby, segment)?)?;
+        let rows = ruby.ary_new_capa(views.len());
+        for segment in views {
+            rows.push(answers::segment(ruby, class, segment)?)?;
         }
         Ok(rows)
     }
 
-    fn pinned(ruby: &Ruby, pin: Result<Pin, Refusal>) -> Value {
-        match pin {
-            Ok(pin) => PinHandle { pin }.into_value_with(ruby),
-            Err(error) => ruby.to_symbol(refusal(error)).as_value(),
-        }
+    fn segments(
+        ruby: &Ruby,
+        this: &Self,
+        after: Option<Number>,
+        limit: Number,
+    ) -> Result<RArray, Error> {
+        Self::scan(ruby, this, after, limit, Scan::All)
+    }
+
+    fn compaction_candidates(
+        ruby: &Ruby,
+        this: &Self,
+        after: Option<Number>,
+        limit: Number,
+    ) -> Result<RArray, Error> {
+        Self::scan(ruby, this, after, limit, Scan::Candidates)
+    }
+
+    fn reclaimable(
+        ruby: &Ruby,
+        this: &Self,
+        after: Option<Number>,
+        limit: Number,
+    ) -> Result<RArray, Error> {
+        Self::scan(ruby, this, after, limit, Scan::Reclaimable)
+    }
+
+    fn pinned(ruby: &Ruby, pin: Result<Pin, Refusal>) -> Result<Value, Error> {
+        reply(ruby, pin, |pin| Ok(PinHandle { pin }.into_value_with(ruby)))
     }
 
     fn pin_reader(ruby: &Ruby, this: Obj<Self>, offset: Number) -> Result<Value, Error> {
         this.check_frozen()?;
         let pin = this.core.borrow_mut().pin_reader(offset.0);
-        Ok(Self::pinned(ruby, pin))
+        Self::pinned(ruby, pin)
     }
 
     fn pin_checkpoint(
@@ -271,7 +244,7 @@ impl Journal {
             .core
             .borrow_mut()
             .pin_checkpoint(assignment.0, offset.0);
-        Ok(Self::pinned(ruby, pin))
+        Self::pinned(ruby, pin)
     }
 
     fn advance(
@@ -282,10 +255,9 @@ impl Journal {
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
         let outcome = this.core.borrow_mut().advance(handle.pin, offset.0);
-        Ok(ruby.to_symbol(match outcome {
-            Ok(Advanced::Unchanged) => "unchanged",
-            Ok(Advanced::Moved) => "moved",
-            Err(error) => refusal(error),
+        Ok(answer(ruby, outcome, |advanced| match advanced {
+            Advanced::Unchanged => "unchanged",
+            Advanced::Moved => "moved",
         }))
     }
 
@@ -301,18 +273,17 @@ impl Journal {
             .core
             .borrow_mut()
             .checkpoint(handle.pin, assignment.0, offset.0);
-        Ok(ruby.to_symbol(match outcome {
-            Ok(Checkpointed::Reassigned) => "reassigned",
-            Ok(Checkpointed::Unchanged) => "unchanged",
-            Ok(Checkpointed::Advanced) => "advanced",
-            Err(error) => refusal(error),
+        Ok(answer(ruby, outcome, |checkpointed| match checkpointed {
+            Checkpointed::Reassigned => "reassigned",
+            Checkpointed::Unchanged => "unchanged",
+            Checkpointed::Advanced => "advanced",
         }))
     }
 
     fn release(ruby: &Ruby, this: Obj<Self>, handle: Obj<PinHandle>) -> Result<Symbol, Error> {
         this.check_frozen()?;
         let outcome = this.core.borrow_mut().release(handle.pin);
-        Ok(answer(ruby, outcome, "released"))
+        Ok(answer(ruby, outcome, |()| "released"))
     }
 
     fn pin_offset(&self, handle: Obj<PinHandle>) -> Option<u64> {
@@ -330,9 +301,8 @@ impl Journal {
     fn propose(ruby: &Ruby, this: Obj<Self>, id: Number) -> Result<Value, Error> {
         this.check_frozen()?;
         let proposed = this.core.borrow_mut().propose(SegmentId::from_raw(id.0));
-        Ok(match proposed {
-            Ok(replacement) => ReplacementHandle { replacement }.into_value_with(ruby),
-            Err(error) => ruby.to_symbol(refusal(error)).as_value(),
+        reply(ruby, proposed, |replacement| {
+            Ok(ReplacementHandle { replacement }.into_value_with(ruby))
         })
     }
 
@@ -347,10 +317,9 @@ impl Journal {
             .core
             .borrow_mut()
             .confirm_durable(handle.replacement, durable);
-        Ok(ruby.to_symbol(match outcome {
-            Ok(Confirmed::AlreadyDurable) => "already_durable",
-            Ok(Confirmed::Recorded) => "recorded",
-            Err(error) => refusal(error),
+        Ok(answer(ruby, outcome, |confirmed| match confirmed {
+            Confirmed::AlreadyDurable => "already_durable",
+            Confirmed::Recorded => "recorded",
         }))
     }
 
@@ -381,17 +350,12 @@ impl Journal {
         this: Obj<Self>,
         handle: Obj<ReplacementHandle>,
     ) -> Result<Value, Error> {
-        this.check_frozen()?;
-        let outcome = this.core.borrow_mut().reclaim(handle.replacement);
-        Ok(match outcome {
-            Ok(reclaimed) => (
-                reclaimed.segment.raw(),
-                reclaimed.revision,
-                reclaimed.bytes,
-                reclaimed.replaced_by,
-            )
-                .into_value_with(ruby),
-            Err(error) => ruby.to_symbol(refusal(error)).as_value(),
+        let class = classes(ruby)?.reclaimed;
+        keep(ruby, this.as_value(), &this.core, |core| {
+            let outcome = core.reclaim(handle.replacement);
+            reply(ruby, outcome, |reclaimed| {
+                answers::reclaimed(class, reclaimed)
+            })
         })
     }
 
@@ -402,6 +366,6 @@ impl Journal {
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
         let outcome = this.core.borrow_mut().abort(handle.replacement);
-        Ok(answer(ruby, outcome, "aborted"))
+        Ok(answer(ruby, outcome, |()| "aborted"))
     }
 }

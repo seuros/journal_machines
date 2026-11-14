@@ -20,6 +20,12 @@ module JournalHelpers
     J::Journal.with_scope(policy, base_offset, now, scope)
   end
 
+  # Everything a caller can read back from a journal. Segments compare
+  # whole: a Replacement is a value, equal to any handle to the same attempt.
+  def snapshot(journal, pins)
+    [journal.size, journal.segments(nil, 64), journal.pins, journal.low_pin, pins.map { journal.pin_offset(it) }]
+  end
+
   # A journal with `count` sealed ten-record, hundred-byte segments.
   def journal_with(count, **)
     journal = open_journal(**)

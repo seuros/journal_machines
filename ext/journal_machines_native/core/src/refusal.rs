@@ -93,3 +93,13 @@ impl fmt::Display for Refusal {
 }
 
 impl core::error::Error for Refusal {}
+
+/// The journal's identity sequence refused to issue: its one refusal is
+/// [`Refusal::Exhausted`].
+impl From<periscope_machines::Refusal> for Refusal {
+    fn from(refusal: periscope_machines::Refusal) -> Self {
+        match refusal {
+            periscope_machines::Refusal::Exhausted => Self::Exhausted,
+        }
+    }
+}

@@ -5,7 +5,7 @@ use periscope_machines::scope_of;
 use crate::{Journal, Refusal};
 
 /// What a pin stands for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PinKind {
     /// A reader positioned at the pinned offset.
     Reader,
@@ -19,7 +19,7 @@ pub enum PinKind {
 /// A pin means something only to the journal that issued it. Its generation
 /// carries that journal's scope, so a journal of another scope refuses it;
 /// two journals left in the same scope cannot tell each other's pins apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Pin {
     pub(crate) slot: usize,
     pub(crate) generation: u64,
@@ -197,8 +197,7 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// another slot than the one the handle names. Nothing was released, and
     /// whoever holds the slot keeps it.
     pub fn release(&mut self, pin: Pin) -> Result<(), Refusal> {
-        self.held_mut(pin).ok_or(Refusal::Stale)?;
-        self.pins[pin.slot] = None;
+        *self.held_entry(pin).ok_or(Refusal::Stale)? = None;
         Ok(())
     }
 
@@ -230,16 +229,14 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     }
 
     fn acquire(&mut self, kind: PinKind, offset: u64, assignment: u64) -> Result<Pin, Refusal> {
-        let slot = self
+        let (slot, entry) = self
             .pins
-            .iter()
-            .position(Option::is_none)
+            .iter_mut()
+            .enumerate()
+            .find(|(_, entry)| entry.is_none())
             .ok_or(Refusal::PinsFull)?;
-        let generation = match self.issuer.issue() {
-            Ok(generation) => generation,
-            Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
-        };
-        self.pins[slot] = Some(PinSlot {
+        let generation = self.issuer.issue()?;
+        *entry = Some(PinSlot {
             generation,
             kind,
             offset,
@@ -252,16 +249,20 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
         })
     }
 
-    /// A pin this journal never issued, of another scope or not yet reached,
-    /// names nothing here: no slot is read.
-    fn held_mut(&mut self, pin: Pin) -> Option<&mut PinSlot> {
+    /// The slot holding `pin`'s acquisition. A pin this journal never
+    /// issued, of another scope or not yet reached, names nothing here: no
+    /// slot is read.
+    fn held_entry(&mut self, pin: Pin) -> Option<&mut Option<PinSlot>> {
         if !self.issuer.owns(pin.generation) {
             return None;
         }
         self.pins
-            .get_mut(pin.slot)?
-            .as_mut()
-            .filter(|held| held.generation == pin.generation)
+            .get_mut(pin.slot)
+            .filter(|entry| entry.is_some_and(|held| held.generation == pin.generation))
+    }
+
+    fn held_mut(&mut self, pin: Pin) -> Option<&mut PinSlot> {
+        self.held_entry(pin)?.as_mut()
     }
 }
 

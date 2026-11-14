@@ -4,6 +4,8 @@ use std::{num::NonZeroU64, time::Duration};
 use journal_machines::{Policy, Refusal};
 use magnus::{Error, Integer, Ruby, Symbol, TryConvert, Value};
 
+use crate::classes::{classes, exact};
+
 #[derive(Clone, Copy)]
 pub struct Number(pub u64);
 
@@ -86,9 +88,29 @@ pub fn policy(
         })
 }
 
-/// The Ruby symbol for a refusal; a done call answers `done` instead.
-pub fn answer<T>(ruby: &Ruby, outcome: Result<T, Refusal>, done: &'static str) -> Symbol {
-    ruby.to_symbol(outcome.map_or_else(refusal, |_| done))
+/// A `Policy` the journal is opened with: exactly a `JournalMachines::Policy`
+/// (`TypeError` otherwise, a subclass included), its four fields read
+/// natively and checked again by the core's `Policy::new` (`RangeError`), so
+/// a forged one never reaches the core.
+pub fn policy_from(ruby: &Ruby, value: Value) -> Result<Policy, Error> {
+    let message = "expected a JournalMachines::Policy";
+    let fields = exact(ruby, value, classes(ruby)?.policy, message)?;
+    policy(
+        ruby,
+        fields.aref(0)?,
+        fields.aref(1)?,
+        fields.aref(2)?,
+        fields.aref(3)?,
+    )
+}
+
+/// The Ruby symbol for a refusal, or the one `name` gives the honoured answer.
+pub fn answer<T>(
+    ruby: &Ruby,
+    outcome: Result<T, Refusal>,
+    name: impl FnOnce(T) -> &'static str,
+) -> Symbol {
+    ruby.to_symbol(outcome.map_or_else(refusal, name))
 }
 
 /// Ruby symbol name of a refusal: the snake case of the core variant.

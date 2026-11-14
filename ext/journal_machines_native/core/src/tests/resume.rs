@@ -3,12 +3,8 @@ use std::vec::Vec;
 
 use periscope_machines::{SEQUENCE_MAX, scoped};
 
-use super::{Small, at, policy};
+use super::{Small, at, open, policy, resumed};
 use crate::*;
-
-fn resumed(scope: u16, issued: u64) -> Option<Small> {
-    Small::resumed(policy(0, 0, 0, 500), 0, at(0), scope, issued)
-}
 
 /// One segment id, one pin generation and one attempt, in raw form.
 fn use_up(journal: &mut Small) -> (Pin, Replacement, Vec<u64>) {
@@ -22,7 +18,7 @@ fn use_up(journal: &mut Small) -> (Pin, Replacement, Vec<u64>) {
 #[test]
 fn resuming_from_nothing_issued_is_a_fresh_journal() {
     for scope in [0, 9, u16::MAX] {
-        let fresh = Small::with_scope(policy(0, 0, 0, 500), 0, at(0), scope);
+        let fresh = open(scope);
         assert_eq!(resumed(scope, 0), Some(fresh.clone()));
         assert_eq!((fresh.scope(), fresh.issued()), (scope, 1));
         assert_eq!(fresh.active().map(|s| s.id.raw()), Some(scoped(scope, 1)));
@@ -32,7 +28,7 @@ fn resuming_from_nothing_issued_is_a_fresh_journal() {
 #[test]
 fn a_resumed_journal_continues_the_sequence_and_reissues_nothing() {
     for scope in [0, 9, u16::MAX] {
-        let mut first = Small::with_scope(policy(0, 0, 0, 500), 0, at(0), scope);
+        let mut first = open(scope);
         let (pin, attempt, mut seen) = use_up(&mut first);
         seen.push(scoped(scope, 1));
         assert_eq!(first.issued(), 4);
@@ -69,9 +65,9 @@ fn a_resumed_journal_continues_the_sequence_and_reissues_nothing() {
 fn a_journal_started_again_in_its_scope_reissues() {
     // The hazard `resumed` closes: without the saved count, an old handle
     // names a new entry.
-    let mut first = Small::with_scope(policy(0, 0, 0, 500), 0, at(0), 9);
+    let mut first = open(9);
     let old = first.pin_reader(5).expect("pin");
-    let mut again = Small::with_scope(policy(0, 0, 0, 500), 0, at(0), 9);
+    let mut again = open(9);
     let new = again.pin_checkpoint(1, 7).expect("pin");
     assert_eq!(old.generation(), new.generation());
     assert_eq!(

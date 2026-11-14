@@ -27,6 +27,16 @@ Time is `core::time::Duration` on a monotonic clock whose epoch the caller
 picks: `now`, a segment's `opened_at` and the policy's `max_age`. Offsets,
 record and byte counts, ids, revisions and generations are `u64`.
 
+- `Rolled::new(sealed, opened, next_offset)`, `Reclaimed::new(segment,
+  revision, bytes, replaced_by)` and `Segment::new(id, revision, base_offset,
+  records, stored_records, live_records, bytes, opened_at, state, pinned,
+  replacement)` answer `Some` only for a value some journal could have
+  answered (issued ids of one scope, revisions and attempts drawn after their
+  segment, a segment whose counts, state, pin and replacement agree). Their
+  fields are private: read them through the accessor of the same name, so no
+  value skips the check.
+- `SegmentId`, `Pin` and `Replacement` are values: two handles to the same
+  identity are equal and hash alike.
 - `Policy::new(max_bytes, max_records, max_age, min_dead_per_mille)` takes
   `Option<NonZeroU64>` sizes and an `Option<Duration>` age; `None` disables a
   threshold. It answers `None` for a per-mille above 1000 or a zero age.
@@ -147,6 +157,37 @@ only the offset range.
 `active`, `segment`, `covering`, the iterators, `pin_offset`, `low_pin` and
 `pins` read only and never refuse.
 
+### Resume positions
+
+`segments`, `compaction_candidates` and `reclaimable` take `after:
+Option<SegmentId>`, a position rather than a handle: nothing is looked up by
+it, and the segment it named may have left the journal since. It must still
+be a number this journal issued (`Issuer::owns`): one of another scope, a
+zero sequence or one not reached is no position, and the iterator is empty.
+That is the same line every other call draws for identities, and it keeps a
+bare `0` (a common stand-in for "from the start") from silently meaning
+"everything". `None` is the one way to begin. Any issued number works, a pin
+generation or an attempt included, because one sequence orders them all.
+
+### Which answers record the clock
+
+The journal keeps no watermark. The only instants it holds are its segments'
+opening times, and a regression is judged against the active segment's.
+`new`, `with_scope`, `resumed` and an honoured `roll` record `now` as the
+opening of the new active segment: their answer depends on the instant.
+`roll_decision` reads only and records nothing; its answer is about the
+instant supplied. No other call takes a clock, and no honoured repeat
+(`Unchanged`, `AlreadyDurable`) records anything.
+
+### Unreachable arms
+
+There are none, and no slot is indexed by a number that could be out of
+range. A lookup by segment id or pin hands back the slot itself, so nothing
+is looked up twice; `roll` takes the active slot and the one after it as one
+pair, whose absence is `SegmentsFull`; a superseded segment leaves by a walk
+over the tracked slots; and the issuer's `Exhausted` is the journal's own
+`Exhausted` (`From<periscope_machines::Refusal>`).
+
 Checkpoint pins compose with `offset-machines`: `pin_checkpoint_from(&tracker)`
 and `checkpoint_from(pin, &tracker)` pin at the tracker's confirmed-committed
 base under its assignment generation, never at merely acknowledged offsets. An
@@ -163,21 +204,22 @@ use core::{num::NonZeroU64, time::Duration};
 use journal_machines::{
     Advanced, Checkpointed, Confirmed, Durable, Journal, Policy, Refusal, Roll, RollReason,
 };
+# fn main() -> Result<(), Box<dyn core::error::Error>> {
 
 let hour = Duration::from_secs(3600);
-let policy = Policy::new(NonZeroU64::new(1024), None, Some(hour), 500).unwrap();
+let policy = Policy::new(NonZeroU64::new(1024), None, Some(hour), 500).ok_or("policy")?;
 let mut journal = Journal::<8, 4>::new(policy, 0, Duration::ZERO);
 let now = Duration::from_secs(5);
 assert_eq!(journal.roll_decision(2048, 10, now), Ok(Roll::Due(RollReason::Size)));
 assert_eq!(journal.roll_decision(1, 1, hour), Ok(Roll::Due(RollReason::Age)));
-let rolled = journal.roll(2048, 10, now).unwrap();
+let rolled = journal.roll(2048, 10, now)?;
 
-let checkpoint = journal.pin_checkpoint(1, 0).unwrap();
-let reader = journal.pin_reader(0).unwrap();
-assert_eq!(journal.observe_live(rolled.sealed, 2), Ok(()));
-assert_eq!(journal.compaction_candidates(None).next().map(|s| s.id), Some(rolled.sealed));
+let checkpoint = journal.pin_checkpoint(1, 0)?;
+let reader = journal.pin_reader(0)?;
+assert_eq!(journal.observe_live(rolled.sealed(), 2), Ok(()));
+assert_eq!(journal.compaction_candidates(None).next().map(|s| s.id()), Some(rolled.sealed()));
 
-let replacement = journal.propose(rolled.sealed).unwrap();
+let replacement = journal.propose(rolled.sealed())?;
 assert_eq!(journal.reclaim(replacement), Err(Refusal::NotDurable));
 let rewritten = Durable::Rewritten { bytes: 400, live_records: 2 };
 assert_eq!(journal.confirm_durable(replacement, rewritten), Ok(Confirmed::Recorded));
@@ -192,22 +234,24 @@ assert_eq!(journal.release(reader), Err(Refusal::Stale));
 assert_eq!(journal.advance(reader, 11), Err(Refusal::Stale));
 
 // One sequence for every kind: no two handles share a raw value.
-assert_eq!((rolled.sealed.raw(), rolled.opened.raw()), (1, 2));
+assert_eq!((rolled.sealed().raw(), rolled.opened().raw()), (1, 2));
 assert_eq!((checkpoint.generation(), reader.generation()), (3, 4));
 assert_eq!((replacement.attempt(), journal.issued()), (5, 5));
 
 // A journal of another scope issues the same sequence numbers under its own
 // scope, and neither takes the other's handles.
 let mut other = Journal::<8, 4>::with_scope(policy, 0, Duration::ZERO, 7);
-let theirs = other.pin_checkpoint(1, 0).unwrap();
+let theirs = other.pin_checkpoint(1, 0)?;
 assert_eq!((checkpoint.scope(), theirs.scope()), (0, 7));
 assert_eq!(journal.release(theirs), Err(Refusal::Stale));
 assert_eq!(other.checkpoint(checkpoint, 1, 10), Err(Refusal::Stale));
 assert_eq!(journal.checkpoint(checkpoint, 1, 10), Ok(Checkpointed::Advanced));
 assert_eq!(journal.checkpoint(checkpoint, 1, 10), Ok(Checkpointed::Unchanged));
-assert_eq!(journal.reclaim(replacement).unwrap().bytes, 2048);
+assert_eq!(journal.reclaim(replacement)?.bytes(), 2048);
 
 // After a restart, continue the sequence from the saved count.
-let resumed = Journal::<8, 4>::resumed(policy, 20, now, 0, journal.issued()).unwrap();
-assert_eq!(resumed.active().map(|segment| segment.id.raw()), Some(6));
+let resumed = Journal::<8, 4>::resumed(policy, 20, now, 0, journal.issued()).ok_or("resume")?;
+assert_eq!(resumed.active().map(|segment| segment.id().raw()), Some(6));
+# Ok(())
+# }
 ```

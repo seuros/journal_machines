@@ -32,9 +32,7 @@ class JournalTest < Minitest::Test
     assert_raises(ArgumentError) { J::Journal.new }
     assert_raises(ArgumentError) { J::Journal.new(policy) }
     [nil, policy.to_h, [100, 10, 50, 250]].each { |v| assert_raises(TypeError) { J::Journal.new(v, 0, 0) } }
-    %i[__policy __roll __active __segment __covering __scan __reclaim].each do |helper|
-      assert_raises(NoMethodError) { journal.public_send(helper) }
-    end
+    assert_raises(NoMethodError) { journal.__policy }
     assert_raises(NoMethodError) { J::Journal.__check_policy(nil, nil, nil, 0) }
   end
 
@@ -199,41 +197,8 @@ class JournalTest < Minitest::Test
     assert_instance_of J::Reclaimed, journal.reclaim(second)
     assert_instance_of J::Reclaimed, journal.reclaim(first)
     assert_equal [3], journal.segments(nil, 64).map(&:id)
-  end
-
-  def test_pins_are_generation_checked
-    journal = open_journal
-    first = journal.pin_reader(5)
-    assert_equal 5, journal.pin_offset(first)
-    assert_equal :released, journal.release(first)
-    assert_equal :stale, journal.release(first)
-    second = journal.pin_reader(1)
-    assert_equal :stale, journal.release(first)
-    assert_equal [1, 1], [journal.pins, journal.pin_offset(second)]
-    assert_equal :stale, journal.advance(first, 50)
-    assert_nil journal.pin_offset(first)
-    assert_equal 1, journal.low_pin
-    assert_equal :regressed, journal.advance(second, 0)
-    assert_equal :unchanged, journal.advance(second, 1)
-    assert_equal :wrong_kind, journal.checkpoint(second, 1, 9)
-    assert_equal :released, journal.release(second)
-    assert_nil journal.low_pin
-    assert_equal 0, journal.pins
-  end
-
-  def test_checkpoint_assignment_generations
-    journal = open_journal
-    assert_equal :unassigned, journal.pin_checkpoint(0, 5)
-    pin = journal.pin_checkpoint(3, 20)
-    assert_equal :wrong_kind, journal.advance(pin, 30)
-    assert_equal :unassigned, journal.checkpoint(pin, 0, 30)
-    assert_equal :stale_assignment, journal.checkpoint(pin, 2, 99)
-    assert_equal :regressed, journal.checkpoint(pin, 3, 19)
-    assert_equal :unchanged, journal.checkpoint(pin, 3, 20)
-    assert_equal :advanced, journal.checkpoint(pin, 3, 25)
-    assert_equal :reassigned, journal.checkpoint(pin, 4, 8)
-    assert_equal 8, journal.pin_offset(pin)
-    assert_equal :reassigned, journal.checkpoint(pin, 2**64 - 1, 2**64 - 1)
+    assert_equal :released, journal.release(checkpoint)
+    assert_equal [0, nil], [journal.pins, journal.low_pin]
   end
 
   def test_checkpoints_follow_one_tracker
@@ -251,6 +216,8 @@ class JournalTest < Minitest::Test
     assert_equal :reassigned, journal.checkpoint_from(pin, Tracker.new(4, 8))
     assert_equal :stale_assignment, journal.checkpoint(pin, 3, 30)
     assert_equal 8, journal.pin_offset(pin)
+    top = 2**64 - 1
+    assert_equal %i[reassigned unchanged], [journal.checkpoint(pin, top, top), journal.checkpoint(pin, top, top)]
     assert_equal :wrong_kind, journal.checkpoint_from(journal.pin_reader(0), Tracker.new(4, 9))
     assert_equal :stale, open_journal.checkpoint_from(pin, Tracker.new(4, 9))
   end

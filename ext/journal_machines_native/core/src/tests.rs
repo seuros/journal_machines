@@ -4,6 +4,7 @@ use std::vec::Vec;
 
 use super::*;
 
+mod checked;
 mod model;
 mod pins;
 mod random;
@@ -14,18 +15,25 @@ mod scope;
 
 type Small = Journal<4, 2>;
 
+/// A journal of scope zero with no thresholds, at offset and instant zero.
+fn fresh() -> Small {
+    open(0)
+}
+
+/// As [`fresh`], issuing in `scope`.
+fn open(scope: u16) -> Small {
+    Small::with_scope(policy(0, 0, 0, 500), 0, at(0), scope)
+}
+
+/// As [`open`], resumed after `issued` identities.
+fn resumed(scope: u16, issued: u64) -> Option<Small> {
+    Small::resumed(policy(0, 0, 0, 500), 0, at(0), scope, issued)
+}
+
 /// A journal of `scope` whose sequence has `left` identities to issue after
 /// its active segment took one, seeded through the public constructor.
 fn worn(scope: u16, left: u64) -> Small {
-    let issued = periscope_machines::SEQUENCE_MAX - left - 1;
-    Small::resumed(policy(0, 0, 0, 500), 0, at(0), scope, issued).expect("resumed")
-}
-
-/// A journal whose sequence is spent, with one sealed segment to name.
-fn spent() -> (Small, SegmentId) {
-    let mut journal = worn(0, 1);
-    let sealed = journal.roll(1, 1, at(0)).expect("roll").sealed;
-    (journal, sealed)
+    resumed(scope, periscope_machines::SEQUENCE_MAX - left - 1).expect("resumed")
 }
 
 /// A monotonic instant or span of `seconds`.
@@ -46,7 +54,7 @@ fn policy(bytes: u64, records: u64, age: u64, per_mille: u16) -> Policy {
 
 /// A journal with `sealed` ten-record, hundred-byte segments behind the active one.
 fn journal_with(sealed: u64) -> (Small, Vec<SegmentId>) {
-    let mut journal = Small::new(policy(0, 0, 0, 500), 0, at(0));
+    let mut journal = fresh();
     let ids = (0..sealed)
         .map(|_| journal.roll(100, 10, at(0)).expect("roll").sealed)
         .collect();
@@ -161,12 +169,10 @@ fn roll_seals_the_active_segment_and_opens_the_next() {
 }
 
 #[test]
-fn full_journal_refuses_to_roll_without_changing() {
+fn a_full_journal_rolls_again_once_a_segment_leaves() {
     let (mut journal, sealed) = journal_with(3);
     assert_eq!((journal.len(), Small::SEGMENT_CAPACITY), (4, 4));
-    let before = journal.clone();
     assert_eq!(journal.roll(1, 1, at(0)), Err(Refusal::SegmentsFull));
-    assert_eq!(journal, before);
     assert_eq!(
         journal.roll_decision(1, 1, at(0)),
         Ok(Roll::Keep),
@@ -183,21 +189,6 @@ fn full_journal_refuses_to_roll_without_changing() {
         Ok(6),
         "ids ascend but are not consecutive: the attempt took 5"
     );
-}
-
-#[test]
-fn zero_capacity_journal_refuses_everything() {
-    let mut journal = Journal::<0, 0>::new(policy(1, 1, 1, 0), 0, at(0));
-    assert!(journal.is_empty());
-    assert_eq!(journal.active(), None);
-    assert_eq!(journal.roll_decision(1, 1, at(1)), Err(Refusal::NoActive));
-    assert_eq!(journal.roll(1, 1, at(1)), Err(Refusal::NoActive));
-    assert_eq!(journal.pin_reader(0), Err(Refusal::PinsFull));
-    assert_eq!(
-        journal.propose(SegmentId::from_raw(1)),
-        Err(Refusal::Unknown)
-    );
-    assert_eq!(journal.segments(None).count(), 0);
 }
 
 #[test]
@@ -280,22 +271,6 @@ fn replacement_moves_from_proposed_to_durable_to_reclaimed() {
         journal.confirm_durable(first, rewritten),
         Ok(Confirmed::Recorded)
     );
-    let before = journal.clone();
-    assert_eq!(
-        journal.confirm_durable(first, rewritten),
-        Ok(Confirmed::AlreadyDurable),
-        "the same payload again is an honoured repeat"
-    );
-    assert_eq!(
-        journal.confirm_durable(first, Durable::Superseded),
-        Err(Refusal::Mismatch),
-        "another payload was never recorded; the first confirmation stands"
-    );
-    assert_eq!(
-        journal.confirm_durable(first, too_many),
-        Err(Refusal::Mismatch)
-    );
-    assert_eq!(journal, before);
     assert_eq!(state(&journal, sealed[0]), Some(SegmentState::Reclaimable));
     assert_eq!(ids(journal.reclaimable(None)), [1]);
     let reclaimed = journal.reclaim(first).expect("reclaim");

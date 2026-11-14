@@ -3,7 +3,7 @@ use std::vec::Vec;
 
 use periscope_machines::{SEQUENCE_MAX, scope_of, scoped};
 
-use super::{Small, at, policy, worn};
+use super::{Small, at, open, policy, worn};
 use crate::*;
 
 /// Everything one journal hands out, built by the same calls in any scope.
@@ -18,7 +18,7 @@ struct Issued {
 }
 
 fn issued(scope: u16) -> Issued {
-    let mut journal = Small::with_scope(policy(0, 0, 0, 500), 0, at(0), scope);
+    let mut journal = open(scope);
     let sealed: Vec<SegmentId> = (0..2)
         .map(|_| journal.roll(100, 10, at(0)).expect("roll").sealed)
         .collect();
@@ -56,49 +56,47 @@ fn a_handle_from_another_journal_names_nothing() {
 }
 
 fn refuses_every_handle_of(journal: &mut Small, other: &Issued) {
-    {
-        let before = journal.clone();
-        // Pins: live ones move and release nothing, repeats are not honoured.
-        assert_eq!(journal.advance(other.reader, 30), Err(Refusal::Stale));
-        assert_eq!(journal.advance(other.reader, 31), Err(Refusal::Stale));
-        let checkpoint = other.checkpoint;
-        assert_eq!(journal.checkpoint(checkpoint, 3, 30), Err(Refusal::Stale));
-        assert_eq!(journal.checkpoint(checkpoint, 4, 0), Err(Refusal::Stale));
-        let tracker = offset_machines::Tracker::<1>::new();
-        assert_eq!(
-            journal.checkpoint_from(checkpoint, &tracker),
-            Err(Refusal::Stale),
-            "refused before the tracker is read"
-        );
-        assert_eq!(journal.release(other.reader), Err(Refusal::Stale));
-        assert_eq!(journal.release(other.released), Err(Refusal::Stale));
-        assert_eq!(journal.pin_offset(other.reader), None);
-        // Replacements: nothing confirmed, repeated, reclaimed or aborted.
-        let rewritten = Durable::Rewritten {
-            bytes: 1,
-            live_records: 1,
-        };
-        assert_eq!(
-            journal.confirm_durable(other.proposed, rewritten),
-            Err(Refusal::Stale)
-        );
-        assert_eq!(
-            journal.confirm_durable(other.durable, Durable::Superseded),
-            Err(Refusal::Stale)
-        );
-        assert_eq!(journal.reclaim(other.durable), Err(Refusal::Stale));
-        assert_eq!(journal.reclaim(other.proposed), Err(Refusal::Stale));
-        assert_eq!(journal.abort(other.proposed), Err(Refusal::Stale));
-        assert_eq!(journal.abort(other.durable), Err(Refusal::Stale));
-        // Segment ids: no such segment, and no position to resume from.
-        assert_eq!(journal.segment(other.sealed), None);
-        assert_eq!(journal.observe_live(other.sealed, 1), Err(Refusal::Unknown));
-        assert_eq!(journal.propose(other.sealed), Err(Refusal::Unknown));
-        assert_eq!(journal.segments(Some(other.sealed)).count(), 0);
-        assert_eq!(journal.compaction_candidates(Some(other.sealed)).count(), 0);
-        assert_eq!(journal.reclaimable(Some(other.sealed)).count(), 0);
-        assert_eq!(*journal, before);
-    }
+    let before = journal.clone();
+    // Pins: live ones move and release nothing, repeats are not honoured.
+    assert_eq!(journal.advance(other.reader, 30), Err(Refusal::Stale));
+    assert_eq!(journal.advance(other.reader, 31), Err(Refusal::Stale));
+    let checkpoint = other.checkpoint;
+    assert_eq!(journal.checkpoint(checkpoint, 3, 30), Err(Refusal::Stale));
+    assert_eq!(journal.checkpoint(checkpoint, 4, 0), Err(Refusal::Stale));
+    let tracker = offset_machines::Tracker::<1>::new();
+    assert_eq!(
+        journal.checkpoint_from(checkpoint, &tracker),
+        Err(Refusal::Stale),
+        "refused before the tracker is read"
+    );
+    assert_eq!(journal.release(other.reader), Err(Refusal::Stale));
+    assert_eq!(journal.release(other.released), Err(Refusal::Stale));
+    assert_eq!(journal.pin_offset(other.reader), None);
+    // Replacements: nothing confirmed, repeated, reclaimed or aborted.
+    let rewritten = Durable::Rewritten {
+        bytes: 1,
+        live_records: 1,
+    };
+    assert_eq!(
+        journal.confirm_durable(other.proposed, rewritten),
+        Err(Refusal::Stale)
+    );
+    assert_eq!(
+        journal.confirm_durable(other.durable, Durable::Superseded),
+        Err(Refusal::Stale)
+    );
+    assert_eq!(journal.reclaim(other.durable), Err(Refusal::Stale));
+    assert_eq!(journal.reclaim(other.proposed), Err(Refusal::Stale));
+    assert_eq!(journal.abort(other.proposed), Err(Refusal::Stale));
+    assert_eq!(journal.abort(other.durable), Err(Refusal::Stale));
+    // Segment ids: no such segment, and no position to resume from.
+    assert_eq!(journal.segment(other.sealed), None);
+    assert_eq!(journal.observe_live(other.sealed, 1), Err(Refusal::Unknown));
+    assert_eq!(journal.propose(other.sealed), Err(Refusal::Unknown));
+    assert_eq!(journal.segments(Some(other.sealed)).count(), 0);
+    assert_eq!(journal.compaction_candidates(Some(other.sealed)).count(), 0);
+    assert_eq!(journal.reclaimable(Some(other.sealed)).count(), 0);
+    assert_eq!(*journal, before);
 }
 
 /// Each journal still honours its own, repeats included.

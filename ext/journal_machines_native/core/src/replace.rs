@@ -1,7 +1,7 @@
 //! Replacement lifecycle: proposed, durable-confirmed, reclaimed.
 use periscope_machines::scope_of;
 
-use crate::{Journal, Phase, Refusal, SegmentId};
+use crate::{Journal, Phase, Refusal, SegmentId, Slot, locate};
 
 /// Handle to one replacement attempt for one sealed segment.
 ///
@@ -9,7 +9,7 @@ use crate::{Journal, Phase, Refusal, SegmentId};
 /// id and its attempt number both carry that journal's scope, so a journal of
 /// another scope refuses it; two journals left in the same scope cannot tell
 /// each other's handles apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Replacement {
     pub(crate) segment: SegmentId,
     pub(crate) attempt: u64,
@@ -63,17 +63,40 @@ pub enum Confirmed {
     AlreadyDurable,
 }
 
-/// Permission to delete one original segment file.
+/// Permission to delete one original segment file; build one with
+/// [`Reclaimed::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reclaimed {
+    pub(crate) segment: SegmentId,
+    pub(crate) revision: u64,
+    pub(crate) bytes: u64,
+    pub(crate) replaced_by: Option<u64>,
+}
+
+impl Reclaimed {
     /// The segment whose original may now be deleted.
-    pub segment: SegmentId,
+    #[must_use]
+    pub const fn segment(&self) -> SegmentId {
+        self.segment
+    }
+
     /// Revision of the original to delete.
-    pub revision: u64,
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Bytes the original occupied.
-    pub bytes: u64,
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     /// Revision now serving the range, or `None` when the segment left the journal.
-    pub replaced_by: Option<u64>,
+    #[must_use]
+    pub const fn replaced_by(&self) -> Option<u64> {
+        self.replaced_by
+    }
 }
 
 impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
@@ -84,17 +107,14 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// [`Refusal::Active`], [`Refusal::Busy`] or [`Refusal::Exhausted`]; a
     /// refusal changes nothing.
     pub fn propose(&mut self, id: SegmentId) -> Result<Replacement, Refusal> {
-        let index = self.index_of(id).ok_or(Refusal::Unknown)?;
-        let slot = self.slots[index].as_mut().ok_or(Refusal::Unknown)?;
+        let (_, slot) =
+            locate(&self.issuer, &mut self.slots, self.len, id).ok_or(Refusal::Unknown)?;
         match slot.phase {
             Phase::Active => return Err(Refusal::Active),
             Phase::Proposed(_) | Phase::Durable(..) => return Err(Refusal::Busy),
             Phase::Sealed => {}
         }
-        let attempt = match self.issuer.issue() {
-            Ok(attempt) => attempt,
-            Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
-        };
+        let attempt = self.issuer.issue()?;
         slot.phase = Phase::Proposed(attempt);
         Ok(Replacement {
             segment: id,
@@ -121,8 +141,7 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
         replacement: Replacement,
         durable: Durable,
     ) -> Result<Confirmed, Refusal> {
-        let index = self.replaced(replacement)?;
-        let slot = self.slots[index].as_mut().ok_or(Refusal::Stale)?;
+        let (_, slot) = self.replaced(replacement)?;
         match slot.phase {
             Phase::Proposed(attempt) if attempt == replacement.attempt => {}
             Phase::Durable(attempt, recorded) if attempt == replacement.attempt => {
@@ -153,8 +172,8 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// [`Refusal::Stale`], [`Refusal::NotDurable`] or [`Refusal::Pinned`];
     /// a refusal changes nothing.
     pub fn reclaim(&mut self, replacement: Replacement) -> Result<Reclaimed, Refusal> {
-        let index = self.replaced(replacement)?;
-        let slot = self.slots[index].ok_or(Refusal::Stale)?;
+        let low_pin = self.low_pin();
+        let (index, slot) = self.replaced(replacement)?;
         let durable = match slot.phase {
             Phase::Durable(attempt, durable) if attempt == replacement.attempt => durable,
             Phase::Proposed(attempt) if attempt == replacement.attempt => {
@@ -164,7 +183,7 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
                 return Err(Refusal::Stale);
             }
         };
-        if let Some(offset) = self.low_pin()
+        if let Some(offset) = low_pin
             && offset < slot.end()
         {
             return Err(Refusal::Pinned { offset });
@@ -180,20 +199,14 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
                 bytes,
                 live_records,
             } => {
-                let mut rewritten = slot;
-                rewritten.revision = replacement.attempt;
-                rewritten.bytes = bytes;
-                rewritten.stored = live_records;
-                rewritten.live = slot.live.min(live_records);
-                rewritten.phase = Phase::Sealed;
-                self.slots[index] = Some(rewritten);
+                slot.revision = replacement.attempt;
+                slot.bytes = bytes;
+                slot.stored = live_records;
+                slot.live = slot.live.min(live_records);
+                slot.phase = Phase::Sealed;
                 reclaimed.replaced_by = Some(replacement.attempt);
             }
-            Durable::Superseded => {
-                self.slots.copy_within(index + 1..self.len, index);
-                self.len -= 1;
-                self.slots[self.len] = None;
-            }
+            Durable::Superseded => self.remove(index),
         }
         Ok(reclaimed)
     }
@@ -203,8 +216,7 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
     /// # Errors
     /// [`Refusal::Stale`]; nothing was abandoned.
     pub fn abort(&mut self, replacement: Replacement) -> Result<(), Refusal> {
-        let index = self.replaced(replacement)?;
-        let slot = self.slots[index].as_mut().ok_or(Refusal::Stale)?;
+        let (_, slot) = self.replaced(replacement)?;
         match slot.phase {
             Phase::Proposed(attempt) | Phase::Durable(attempt, _)
                 if attempt == replacement.attempt =>
@@ -218,13 +230,27 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
         }
     }
 
-    /// Slot of the segment a handle names. A handle whose attempt or segment
-    /// this journal never issued, of another scope or not yet reached, names
-    /// nothing here: no slot is read.
-    fn replaced(&self, replacement: Replacement) -> Result<usize, Refusal> {
+    /// Slot index and the segment a handle names. A handle whose attempt or
+    /// segment this journal never issued, of another scope or not yet
+    /// reached, names nothing here: no slot is read.
+    fn replaced(&mut self, replacement: Replacement) -> Result<(usize, &mut Slot), Refusal> {
         if !self.issuer.owns(replacement.attempt) {
             return Err(Refusal::Stale);
         }
-        self.index_of(replacement.segment).ok_or(Refusal::Stale)
+        self.find_mut(replacement.segment).ok_or(Refusal::Stale)
+    }
+
+    /// Drop the tracked segment at `index`, shifting the later ones down so
+    /// the tracked slots stay a prefix.
+    fn remove(&mut self, index: usize) {
+        let mut hole: Option<&mut Option<Slot>> = None;
+        for entry in self.slots.iter_mut().take(self.len).skip(index) {
+            let moved = entry.take();
+            if let Some(previous) = hole {
+                *previous = moved;
+            }
+            hole = Some(entry);
+        }
+        self.len -= 1;
     }
 }

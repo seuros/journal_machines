@@ -1,6 +1,9 @@
 //! Roll and compaction thresholds.
 use core::{num::NonZeroU64, time::Duration};
 
+/// The whole of a per-mille ratio: every stored record dead.
+const PER_MILLE: u16 = 1000;
+
 /// Why the active segment is due to roll. Checked in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RollReason {
@@ -34,7 +37,7 @@ impl Policy {
         max_age: Option<Duration>,
         min_dead_per_mille: u16,
     ) -> Option<Self> {
-        if min_dead_per_mille > 1000 || matches!(max_age, Some(age) if age.is_zero()) {
+        if min_dead_per_mille > PER_MILLE || matches!(max_age, Some(age) if age.is_zero()) {
             return None;
         }
         Some(Self {
@@ -86,6 +89,7 @@ impl Policy {
     pub(crate) fn compactable(&self, stored: u64, live: u64) -> bool {
         let dead = stored.saturating_sub(live);
         dead > 0
-            && u128::from(dead) * 1000 >= u128::from(stored) * u128::from(self.min_dead_per_mille)
+            && u128::from(dead) * u128::from(PER_MILLE)
+                >= u128::from(stored) * u128::from(self.min_dead_per_mille)
     }
 }

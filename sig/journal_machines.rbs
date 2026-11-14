@@ -43,19 +43,27 @@ module JournalMachines
   # journal counts from 1 for all three, so no two of them are equal. A
   # Journal that never issued it answers :stale to a Pin or Replacement (nil
   # from pin_offset) and :unknown to a segment id (nil from segment, [] from
-  # the scans for one of another scope). Two Journals left in the same scope
+  # the scans as a resume position). Two Journals left in the same scope
   # cannot tell their handles apart.
   class Pin
     def kind: () -> (:reader | :checkpoint)
     def generation: () -> Integer
     # The scope of the Journal that issued this pin.
     def scope: () -> Integer
+    # A value: equal to, and hashing like, any handle to the same identity.
+    def ==: (untyped other) -> bool
+    def eql?: (untyped other) -> bool
+    def hash: () -> Integer
   end
   class Replacement
     def segment: () -> Integer
     def attempt: () -> Integer
     # The scope of the Journal that issued this attempt.
     def scope: () -> Integer
+    # A value: equal to, and hashing like, any handle to the same identity.
+    def ==: (untyped other) -> bool
+    def eql?: (untyped other) -> bool
+    def hash: () -> Integer
   end
   # The core's Policy: same fields, same order, no defaults. A zero threshold
   # or a ratio above 1000 raises RangeError; a non-Integer raises TypeError.
@@ -67,6 +75,11 @@ module JournalMachines
     def self.new: (Integer? max_bytes, Integer? max_records, nanoseconds? max_age, Integer min_dead_per_mille) -> Policy
                 | (max_bytes: Integer?, max_records: Integer?, max_age: nanoseconds?, min_dead_per_mille: Integer) -> Policy
   end
+  # The core's Segment. `new` mirrors `Segment::checked`: RangeError unless
+  # some journal could answer these eleven values together (an issued id; an
+  # active segment holding nothing; a closed one with records >= stored >=
+  # live; a replacement exactly when proposed, durable or reclaimable;
+  # durable pinned, reclaimable not). TypeError for a wrong type.
   class Segment < Data
     attr_reader id: Integer
     attr_reader revision: Integer
@@ -79,24 +92,41 @@ module JournalMachines
     attr_reader state: segment_state
     attr_reader pinned: bool
     attr_reader replacement: Replacement?
+    def self.new: (Integer id, Integer revision, Integer base_offset, Integer records, Integer stored_records,
+                   Integer live_records, Integer bytes, nanoseconds opened_at, segment_state state, bool pinned,
+                   Replacement? replacement) -> Segment
+                | (id: Integer, revision: Integer, base_offset: Integer, records: Integer, stored_records: Integer,
+                   live_records: Integer, bytes: Integer, opened_at: nanoseconds, state: segment_state, pinned: bool,
+                   replacement: Replacement?) -> Segment
     def end_offset: () -> Integer
   end
-  # The core's Roll::Due(reason); Roll::Keep is the symbol :keep.
+  # The core's Roll::Due(reason); Roll::Keep is the symbol :keep. Another
+  # Symbol raises RangeError, a non-Symbol TypeError.
   class Due < Data
     attr_reader reason: roll_reason
     def self.new: (roll_reason reason) -> Due
                 | (reason: roll_reason) -> Due
   end
+  # The core's Rolled. `new` mirrors `Rolled::new`: RangeError unless both ids
+  # are issued ids of one scope, opened drawn after sealed, and next_offset is
+  # positive. TypeError for a non-Integer.
   class Rolled < Data
     attr_reader sealed: Integer
     attr_reader opened: Integer
     attr_reader next_offset: Integer
+    def self.new: (Integer sealed, Integer opened, Integer next_offset) -> Rolled
+                | (sealed: Integer, opened: Integer, next_offset: Integer) -> Rolled
   end
+  # The core's Reclaimed. `new` mirrors `Reclaimed::new`: RangeError unless the
+  # segment id is issued, revision is 0 or an attempt drawn after it, and
+  # replaced_by is nil or a later attempt still. TypeError for a non-Integer.
   class Reclaimed < Data
     attr_reader segment: Integer
     attr_reader revision: Integer
     attr_reader bytes: Integer
     attr_reader replaced_by: Integer?
+    def self.new: (Integer segment, Integer revision, Integer bytes, Integer? replaced_by) -> Reclaimed
+                | (segment: Integer, revision: Integer, bytes: Integer, replaced_by: Integer?) -> Reclaimed
   end
   class Journal
     # A journal in scope zero.
@@ -125,6 +155,9 @@ module JournalMachines
     def active: () -> Segment?
     def segment: (Integer id) -> Segment?
     def covering: (Integer offset) -> Segment?
+    # `after` must be an id this journal issued (any of its segment ids, pin
+    # generations or attempts, even one whose segment has left); one it never
+    # issued (another scope, sequence zero, not reached) is no position: [].
     def segments: (Integer? after, Integer limit) -> Array[Segment]
     def compaction_candidates: (Integer? after, Integer limit) -> Array[Segment]
     def reclaimable: (Integer? after, Integer limit) -> Array[Segment]
@@ -152,8 +185,6 @@ module JournalMachines
 
     private
 
-    REASONS: Array[roll_reason]
-    def wrap: (Array[untyped]? row) -> Segment?
     def checkpoint_source: (_Tracker tracker) -> [Integer, Integer]
   end
 end

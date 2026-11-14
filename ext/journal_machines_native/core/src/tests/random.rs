@@ -34,11 +34,13 @@ fn compare(real: &Real, model: &Model, rng: &mut Rng) {
         real.low_pin(),
         model.pins.iter().map(|pin| pin.offset).min()
     );
-    // One resume position in six is an id of another scope: no position here.
+    // One resume position in six is an id of another scope, and sequence zero
+    // and the one past `issued` were never issued: no position here.
     let after_scope = model.scope ^ u16::from(rng.below(6) == 0);
-    let after = SegmentId::from_raw(scoped(after_scope, rng.below(model.issued + 2)));
+    let sequence = rng.below(model.issued + 2);
+    let after = SegmentId::from_raw(scoped(after_scope, sequence));
     let resumed = |views: Vec<Segment>| -> Vec<Segment> {
-        let ours = after.scope() == model.scope;
+        let ours = after.scope() == model.scope && sequence != 0 && sequence <= model.issued;
         let later = views.into_iter().filter(|view| ours && view.id > after);
         later.collect()
     };
@@ -71,6 +73,11 @@ fn compare(real: &Real, model: &Model, rng: &mut Rng) {
     );
     for view in &want {
         assert_eq!(real.segment(view.id), Some(*view));
+        assert_eq!(
+            view.checked(),
+            Some(*view),
+            "every answered view is a valid one"
+        );
     }
     for pin in &model.pins {
         let holds = want
@@ -177,7 +184,7 @@ fn run(seed: u64, steps: usize, scope: u16, start: u64, tally: &mut Seen) {
     let mut clock = 10_u64;
     let mut pins: Vec<Pin> = Vec::new();
     let mut handles: Vec<Replacement> = Vec::new();
-    let mut foreign = Real::resumed(policy, base, at(10), scope, start).expect("resumed");
+    let mut foreign = real.clone();
     let mut strangers: Vec<Pin> = Vec::new();
     for _ in 0..steps {
         let before = real.clone();
@@ -237,6 +244,10 @@ fn run(seed: u64, steps: usize, scope: u16, start: u64, tally: &mut Seen) {
                 let (bytes, records) = (rng.below(60), rng.below(6));
                 let got = real.roll(bytes, records, at(now));
                 assert_eq!(got, model.roll(bytes, records, now));
+                if let Ok(rolled) = got {
+                    let again = Rolled::new(rolled.sealed, rolled.opened, rolled.next_offset);
+                    assert_eq!(again, Some(rolled));
+                }
                 got.is_err()
             }
             3 => {
@@ -306,6 +317,11 @@ fn run(seed: u64, steps: usize, scope: u16, start: u64, tally: &mut Seen) {
             11 => handle.is_none_or(|handle| {
                 let got = real.reclaim(handle);
                 assert_eq!(got, model.reclaim(handle));
+                if let Ok(done) = got {
+                    let again =
+                        Reclaimed::new(done.segment, done.revision, done.bytes, done.replaced_by);
+                    assert_eq!(again, Some(done));
+                }
                 assert!(!foreign_handle || got == Err(Refusal::Stale));
                 got.is_err()
             }),

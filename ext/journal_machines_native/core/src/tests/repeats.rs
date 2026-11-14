@@ -3,17 +3,12 @@
 //! and for the second release it can no longer prove.
 use core::time::Duration;
 
-use super::{Small, at, policy};
+use super::{Small, at, fresh, open};
 use crate::*;
-
-fn fresh() -> Small {
-    Small::new(policy(0, 0, 0, 500), 0, at(0))
-}
 
 #[test]
 fn releasing_a_pin_another_scope_issued_is_stale() {
-    let mut a = Small::with_scope(policy(0, 0, 0, 500), 0, at(0), 1);
-    let mut b = Small::with_scope(policy(0, 0, 0, 500), 0, at(0), 2);
+    let (mut a, mut b) = (open(1), open(2));
     let p = a.pin_checkpoint(1, 0).expect("checkpoint");
     let q = b.pin_reader(0).expect("reader");
     assert_eq!(b.release(q), Ok(()));

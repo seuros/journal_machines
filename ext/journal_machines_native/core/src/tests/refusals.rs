@@ -2,7 +2,7 @@
 //! bit-for-bit unchanged.
 use std::string::ToString;
 
-use super::{Small, at, journal_with, policy, spent};
+use super::{Small, at, fresh, journal_with, policy};
 use crate::*;
 
 /// Run `call`, expect `want`, and prove the journal did not change.
@@ -35,6 +35,11 @@ fn roll_and_observe_refusals_change_nothing() {
         j.roll_decision(1, 1, at(1))
     });
     refused(&mut none, Refusal::PinsFull, |j| j.pin_reader(0));
+    refused(&mut none, Refusal::Unknown, |j| {
+        j.propose(SegmentId::from_raw(1))
+    });
+    assert!(none.is_empty());
+    assert_eq!((none.active(), none.segments(None).count()), (None, 0));
 
     let mut journal = Small::new(policy(0, 0, 0, 500), u64::MAX - 5, at(7));
     refused(&mut journal, Refusal::Empty, |j| j.roll(1, 0, at(7)));
@@ -82,7 +87,7 @@ fn pin_refusals_change_nothing() {
     // Nothing remembers a released pin: releasing it again is not provable.
     refused(&mut journal, Refusal::Stale, |j| j.release(gone));
     // A journal that has issued no pin never issued this one.
-    let mut other = Small::new(policy(0, 0, 0, 500), 0, at(0));
+    let mut other = fresh();
     refused(&mut other, Refusal::Stale, |j| j.release(checkpoint));
     refused(&mut journal, Refusal::WrongKind, |j| {
         j.advance(checkpoint, 9)
@@ -113,6 +118,19 @@ fn pin_refusals_change_nothing() {
         journal.checkpoint(checkpoint, 4, 0),
         Ok(Checkpointed::Reassigned)
     );
+    assert_eq!(
+        journal.pin_offset(checkpoint),
+        Some(0),
+        "the new owner reports its own base"
+    );
+    let top = u64::MAX;
+    assert_eq!(
+        journal.checkpoint(checkpoint, top, top),
+        Ok(Checkpointed::Reassigned)
+    );
+    repeated(&mut journal, Checkpointed::Unchanged, |j| {
+        j.checkpoint(checkpoint, top, top)
+    });
 }
 
 #[test]
@@ -156,16 +174,6 @@ fn replacement_refusals_change_nothing() {
     assert_eq!(journal.release(pin), Ok(()));
     assert!(journal.reclaim(current).is_ok());
     refused(&mut journal, Refusal::Stale, |j| j.reclaim(current));
-}
-
-#[test]
-fn spent_identity_spaces_are_exhausted_not_overflow() {
-    let (mut worn, sealed) = spent();
-    assert_eq!(worn.issued(), periscope_machines::SEQUENCE_MAX);
-    refused(&mut worn, Refusal::Exhausted, |j| j.roll(1, 1, at(0)));
-    refused(&mut worn, Refusal::Exhausted, |j| j.propose(sealed));
-    refused(&mut worn, Refusal::Exhausted, |j| j.pin_reader(0));
-    refused(&mut worn, Refusal::Exhausted, |j| j.pin_checkpoint(1, 0));
 }
 
 #[test]
