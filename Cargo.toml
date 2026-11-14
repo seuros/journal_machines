@@ -10,8 +10,9 @@ license = "MIT"
 journal-machines = { path = "ext/journal_machines_native/core" }
 magnus = { version = "0.9.3", default-features = false }
 rb-sys = { version = "0.9.130", default-features = false, features = ["stable-api-compiled-fallback"] }
-offset-machines = ">=0.4"
+offset-machines = ">=0.5"
 periscope-machines = ">=0.4"
+matryona-machines = { version = ">=0.2", default-features = false }
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "warn"

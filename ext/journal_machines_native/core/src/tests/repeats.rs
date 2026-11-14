@@ -3,6 +3,8 @@
 //! and for the second release it can no longer prove.
 use core::time::Duration;
 
+use matryona_machines::testing::{refuses, unchanged};
+
 use super::{Small, at, fresh, open};
 use crate::*;
 
@@ -12,13 +14,8 @@ fn releasing_a_pin_another_scope_issued_is_stale() {
     let p = a.pin_checkpoint(1, 0).expect("checkpoint");
     let q = b.pin_reader(0).expect("reader");
     assert_eq!(b.release(q), Ok(()));
-    let before = b.clone();
-    assert_eq!(
-        b.release(p),
-        Err(Refusal::Stale),
-        "the same slot and sequence number under another scope is not a repeat"
-    );
-    assert_eq!(b, before);
+    // The same slot and sequence number under another scope is not a repeat.
+    refuses(&mut b, Refusal::Stale, |b| b.release(p));
     assert_eq!(a.pin_offset(p), Some(0), "the issuer still holds it");
 }
 
@@ -28,20 +25,15 @@ fn releasing_a_released_pin_is_stale_and_spares_the_slot() {
     let first = journal.pin_reader(3).expect("pin");
     let kept = journal.pin_checkpoint(2, 4).expect("pin");
     assert_eq!(journal.release(first), Ok(()));
-    let before = journal.clone();
-    assert_eq!(journal.release(first), Err(Refusal::Stale));
-    assert_eq!(journal, before);
+    refuses(&mut journal, Refusal::Stale, |j| j.release(first));
     let second = journal.pin_reader(7).expect("pin");
     assert_eq!((first.slot, first.kind()), (second.slot, second.kind()));
-    let before = journal.clone();
-    assert_eq!(journal.release(first), Err(Refusal::Stale));
-    assert_eq!(journal, before, "the slot's new holder keeps it");
+    // The slot's new holder keeps it.
+    refuses(&mut journal, Refusal::Stale, |j| j.release(first));
     assert_eq!(journal.pin_offset(second), Some(7));
     // Reader or checkpoint alike.
     assert_eq!(journal.release(kept), Ok(()));
-    let before = journal.clone();
-    assert_eq!(journal.release(kept), Err(Refusal::Stale));
-    assert_eq!(journal, before);
+    refuses(&mut journal, Refusal::Stale, |j| j.release(kept));
     // Released is not live again for anything else.
     assert_eq!(journal.advance(first, 9), Err(Refusal::Stale));
     assert_eq!(journal.checkpoint(kept, 2, 9), Err(Refusal::Stale));
@@ -80,9 +72,7 @@ fn a_pin_this_journal_never_issued_or_holds_elsewhere_is_stale() {
     let mine = journal.pin_reader(1).expect("pin");
     let _ = ahead.pin_reader(1).expect("pin");
     let beyond = ahead.pin_reader(1).expect("pin");
-    let before = journal.clone();
-    assert_eq!(journal.release(beyond), Err(Refusal::Stale));
-    assert_eq!(journal, before);
+    refuses(&mut journal, Refusal::Stale, |j| j.release(beyond));
 
     // A handle whose generation is held here, in another slot than it names,
     // is not that pin.
@@ -92,9 +82,7 @@ fn a_pin_this_journal_never_issued_or_holds_elsewhere_is_stale() {
         slot: mine.slot,
         ..other
     };
-    let before = journal.clone();
-    assert_eq!(journal.release(misplaced), Err(Refusal::Stale));
-    assert_eq!(journal, before);
+    refuses(&mut journal, Refusal::Stale, |j| j.release(misplaced));
     assert_eq!(journal.pin_offset(other), Some(2));
 }
 
@@ -111,28 +99,24 @@ fn confirming_a_durable_attempt_with_another_payload_is_a_mismatch() {
         journal.confirm_durable(handle, rewritten),
         Ok(Confirmed::Recorded)
     );
-    let before = journal.clone();
-    assert_eq!(
-        journal.confirm_durable(handle, Durable::Superseded),
-        Err(Refusal::Mismatch),
-        "the supersession asked for was never recorded"
-    );
+    // The supersession asked for was never recorded.
+    refuses(&mut journal, Refusal::Mismatch, |j| {
+        j.confirm_durable(handle, Durable::Superseded)
+    });
     for (bytes, live_records) in [(51, 5), (50, 4), (50, 11)] {
         let other = Durable::Rewritten {
             bytes,
             live_records,
         };
-        assert_eq!(
-            journal.confirm_durable(handle, other),
-            Err(Refusal::Mismatch)
-        );
+        refuses(&mut journal, Refusal::Mismatch, |j| {
+            j.confirm_durable(handle, other)
+        });
     }
     assert_eq!(
-        journal.confirm_durable(handle, rewritten),
+        unchanged(&mut journal, |j| j.confirm_durable(handle, rewritten)),
         Ok(Confirmed::AlreadyDurable),
         "the identical payload is the provable repeat"
     );
-    assert_eq!(journal, before);
     let reclaimed = journal.reclaim(handle).expect("reclaim");
     assert_eq!(reclaimed.replaced_by, Some(handle.attempt()));
     assert_eq!(journal.segment(sealed).expect("kept").bytes, 50);
@@ -147,20 +131,18 @@ fn confirming_a_superseded_attempt_as_rewritten_is_a_mismatch() {
         journal.confirm_durable(handle, Durable::Superseded),
         Ok(Confirmed::Recorded)
     );
-    let before = journal.clone();
     let rewritten = Durable::Rewritten {
         bytes: 50,
         live_records: 5,
     };
+    refuses(&mut journal, Refusal::Mismatch, |j| {
+        j.confirm_durable(handle, rewritten)
+    });
     assert_eq!(
-        journal.confirm_durable(handle, rewritten),
-        Err(Refusal::Mismatch)
-    );
-    assert_eq!(
-        journal.confirm_durable(handle, Durable::Superseded),
+        unchanged(&mut journal, |j| j
+            .confirm_durable(handle, Durable::Superseded)),
         Ok(Confirmed::AlreadyDurable)
     );
-    assert_eq!(journal, before);
     assert_eq!(journal.reclaim(handle).expect("reclaim").replaced_by, None);
     assert_eq!(journal.segment(sealed), None);
 }

@@ -1,83 +1,35 @@
 //! Ruby value conversion and refusal names.
-use std::{num::NonZeroU64, time::Duration};
+use std::num::NonZeroU64;
 
 use journal_machines::{Policy, Refusal};
-use magnus::{Error, Integer, Ruby, Symbol, TryConvert, Value};
+use magnus::{Error, Ruby, Symbol, Value, prelude::*};
+use matryona_machines::ruby::{exact_fields, integer, positive, symbol};
 
-use crate::classes::{classes, exact};
+use crate::classes::classes;
 
-#[derive(Clone, Copy)]
-pub struct Number(pub u64);
-
-impl TryConvert for Number {
-    fn try_convert(value: Value) -> Result<Self, Error> {
-        if Integer::from_value(value).is_none() {
-            return Err(Error::new(
-                Ruby::get_with(value).exception_type_error(),
-                "expected an Integer (unsigned 64-bit)",
-            ));
-        }
-        u64::try_convert(value).map(Self)
-    }
+/// A roll threshold: `nil` disables it, anything else is a positive Integer.
+fn threshold(value: Option<Value>, name: &str) -> Result<Option<NonZeroU64>, Error> {
+    value.map(|value| positive(value, name)).transpose()
 }
 
-/// A scope: an Integer in `0..=65535`.
-#[derive(Clone, Copy)]
-pub struct Scope(pub u16);
-
-impl TryConvert for Scope {
-    fn try_convert(value: Value) -> Result<Self, Error> {
-        let ruby = Ruby::get_with(value);
-        if Integer::from_value(value).is_none() {
-            return Err(Error::new(
-                ruby.exception_type_error(),
-                "scope must be an Integer",
-            ));
-        }
-        u16::try_convert(value)
-            .map(Self)
-            .map_err(|_| Error::new(ruby.exception_range_error(), "scope must be in 0..=65535"))
-    }
-}
-
-impl Number {
-    /// A monotonic instant or span given as Integer nanoseconds.
-    pub const fn nanos(self) -> Duration {
-        Duration::from_nanos(self.0)
-    }
-}
-
-/// Integer nanoseconds of an instant the binding was handed as nanoseconds.
-pub fn nanos(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-fn threshold(ruby: &Ruby, limit: Option<Number>) -> Result<Option<NonZeroU64>, Error> {
-    limit.map_or(Ok(None), |limit| {
-        NonZeroU64::new(limit.0).map(Some).ok_or_else(|| {
-            Error::new(
-                ruby.exception_range_error(),
-                "a roll threshold must be positive, or nil to disable it",
-            )
-        })
-    })
-}
-
-/// The core policy for the four `Policy` fields as Ruby passes them; raises
-/// `RangeError` where the core constructor answers `None`.
+/// The core policy for the four `Policy` fields as Ruby passes them. Each is
+/// converted first, in order; then `RangeError` where the core constructor
+/// answers `None`.
 pub fn policy(
     ruby: &Ruby,
-    max_bytes: Option<Number>,
-    max_records: Option<Number>,
-    max_age: Option<Number>,
-    min_dead_per_mille: Number,
+    max_bytes: Option<Value>,
+    max_records: Option<Value>,
+    max_age: Option<Value>,
+    min_dead_per_mille: Value,
 ) -> Result<Policy, Error> {
-    let (max_bytes, max_records, max_age) = (
-        threshold(ruby, max_bytes)?,
-        threshold(ruby, max_records)?,
-        threshold(ruby, max_age)?.map(|age| Number(age.get()).nanos()),
+    let (max_bytes, max_records) = (
+        threshold(max_bytes, "max_bytes")?,
+        threshold(max_records, "max_records")?,
     );
-    u16::try_from(min_dead_per_mille.0)
+    let max_age =
+        threshold(max_age, "max_age")?.map(|age| std::time::Duration::from_nanos(age.get()));
+    let per_mille: u64 = integer(min_dead_per_mille, "min_dead_per_mille")?;
+    u16::try_from(per_mille)
         .ok()
         .and_then(|per_mille| Policy::new(max_bytes, max_records, max_age, per_mille))
         .ok_or_else(|| {
@@ -90,17 +42,19 @@ pub fn policy(
 
 /// A `Policy` the journal is opened with: exactly a `JournalMachines::Policy`
 /// (`TypeError` otherwise, a subclass included), its four fields read
-/// natively and checked again by the core's `Policy::new` (`RangeError`), so
-/// a forged one never reaches the core.
+/// from the struct and checked again by the core's `Policy::new`
+/// (`RangeError`), so a forged one never reaches the core.
 pub fn policy_from(ruby: &Ruby, value: Value) -> Result<Policy, Error> {
-    let message = "expected a JournalMachines::Policy";
-    let fields = exact(ruby, value, classes(ruby)?.policy, message)?;
+    let class = classes(ruby)?.policy.get(ruby);
+    let [max_bytes, max_records, max_age, per_mille] =
+        exact_fields::<4>(ruby, value, class, "expected a JournalMachines::Policy")?;
+    let optional = |value: Value| (!value.is_nil()).then_some(value);
     policy(
         ruby,
-        fields.aref(0)?,
-        fields.aref(1)?,
-        fields.aref(2)?,
-        fields.aref(3)?,
+        optional(max_bytes),
+        optional(max_records),
+        optional(max_age),
+        per_mille,
     )
 }
 
@@ -110,7 +64,7 @@ pub fn answer<T>(
     outcome: Result<T, Refusal>,
     name: impl FnOnce(T) -> &'static str,
 ) -> Symbol {
-    ruby.to_symbol(outcome.map_or_else(refusal, name))
+    symbol(ruby, outcome.map_or_else(refusal, name))
 }
 
 /// Ruby symbol name of a refusal: the snake case of the core variant.

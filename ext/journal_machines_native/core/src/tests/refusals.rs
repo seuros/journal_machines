@@ -2,19 +2,10 @@
 //! bit-for-bit unchanged.
 use std::string::ToString;
 
+use matryona_machines::testing::{refuses, unchanged};
+
 use super::{Small, at, fresh, journal_with, policy};
 use crate::*;
-
-/// Run `call`, expect `want`, and prove the journal did not change.
-fn refused<T: core::fmt::Debug + PartialEq, const S: usize, const P: usize>(
-    journal: &mut Journal<S, P>,
-    want: Refusal,
-    call: impl FnOnce(&mut Journal<S, P>) -> Result<T, Refusal>,
-) {
-    let before = journal.clone();
-    assert_eq!(call(journal), Err(want));
-    assert_eq!(*journal, before, "{want:?} must change nothing");
-}
 
 /// Run `call`, expect the honoured repeat `want`, and prove nothing changed.
 fn repeated<T: core::fmt::Debug + PartialEq>(
@@ -22,88 +13,86 @@ fn repeated<T: core::fmt::Debug + PartialEq>(
     want: T,
     call: impl FnOnce(&mut Small) -> Result<T, Refusal>,
 ) {
-    let before = journal.clone();
-    assert_eq!(call(journal), Ok(want));
-    assert_eq!(*journal, before, "a repeat must change nothing");
+    assert_eq!(unchanged(journal, call), Ok(want));
 }
 
 #[test]
 fn roll_and_observe_refusals_change_nothing() {
     let mut none = Journal::<0, 0>::new(policy(1, 1, 1, 0), 0, at(0));
-    refused(&mut none, Refusal::NoActive, |j| j.roll(1, 1, at(1)));
-    refused(&mut none, Refusal::NoActive, |j| {
+    refuses(&mut none, Refusal::NoActive, |j| j.roll(1, 1, at(1)));
+    refuses(&mut none, Refusal::NoActive, |j| {
         j.roll_decision(1, 1, at(1))
     });
-    refused(&mut none, Refusal::PinsFull, |j| j.pin_reader(0));
-    refused(&mut none, Refusal::Unknown, |j| {
+    refuses(&mut none, Refusal::PinsFull, |j| j.pin_reader(0));
+    refuses(&mut none, Refusal::Unknown, |j| {
         j.propose(SegmentId::from_raw(1))
     });
     assert!(none.is_empty());
     assert_eq!((none.active(), none.segments(None).count()), (None, 0));
 
     let mut journal = Small::new(policy(0, 0, 0, 500), u64::MAX - 5, at(7));
-    refused(&mut journal, Refusal::Empty, |j| j.roll(1, 0, at(7)));
-    refused(&mut journal, Refusal::TimeRegression, |j| {
+    refuses(&mut journal, Refusal::Empty, |j| j.roll(1, 0, at(7)));
+    refuses(&mut journal, Refusal::TimeRegression, |j| {
         j.roll(1, 1, at(6))
     });
-    refused(&mut journal, Refusal::TimeRegression, |j| {
+    refuses(&mut journal, Refusal::TimeRegression, |j| {
         j.roll_decision(1, 1, at(6))
     });
-    refused(&mut journal, Refusal::Overflow, |j| j.roll(1, 6, at(7)));
-    refused(&mut journal, Refusal::Overflow, |j| {
+    refuses(&mut journal, Refusal::Overflow, |j| j.roll(1, 6, at(7)));
+    refuses(&mut journal, Refusal::Overflow, |j| {
         j.roll_decision(1, 6, at(7))
     });
 
     let (mut full, sealed) = journal_with(3);
-    refused(&mut full, Refusal::SegmentsFull, |j| j.roll(1, 1, at(0)));
+    refuses(&mut full, Refusal::SegmentsFull, |j| j.roll(1, 1, at(0)));
     let active = full.active().expect("active").id;
-    refused(&mut full, Refusal::Unknown, |j| {
+    refuses(&mut full, Refusal::Unknown, |j| {
         j.observe_live(SegmentId::from_raw(9), 0)
     });
-    refused(&mut full, Refusal::Active, |j| j.observe_live(active, 0));
-    refused(&mut full, Refusal::Exceeds, |j| {
+    refuses(&mut full, Refusal::Active, |j| j.observe_live(active, 0));
+    refuses(&mut full, Refusal::Exceeds, |j| {
         j.observe_live(sealed[0], 11)
     });
-    refused(&mut full, Refusal::Unknown, |j| {
+    refuses(&mut full, Refusal::Unknown, |j| {
         j.propose(SegmentId::from_raw(9))
     });
-    refused(&mut full, Refusal::Active, |j| j.propose(active));
+    refuses(&mut full, Refusal::Active, |j| j.propose(active));
 }
 
 #[test]
 fn pin_refusals_change_nothing() {
     let (mut journal, _) = journal_with(1);
-    refused(&mut journal, Refusal::Unassigned, |j| {
+    refuses(&mut journal, Refusal::Unassigned, |j| {
         j.pin_checkpoint(0, 5)
     });
     let gone = journal.pin_reader(1).expect("pin");
     assert_eq!(journal.release(gone), Ok(()));
     let reader = journal.pin_reader(5).expect("reader");
     let checkpoint = journal.pin_checkpoint(3, 5).expect("checkpoint");
-    refused(&mut journal, Refusal::PinsFull, |j| j.pin_reader(0));
-    refused(&mut journal, Refusal::PinsFull, |j| j.pin_checkpoint(1, 0));
-    refused(&mut journal, Refusal::Stale, |j| j.advance(gone, 9));
-    refused(&mut journal, Refusal::Stale, |j| j.checkpoint(gone, 3, 9));
+    refuses(&mut journal, Refusal::PinsFull, |j| j.pin_reader(0));
+    refuses(&mut journal, Refusal::PinsFull, |j| j.pin_checkpoint(1, 0));
+    refuses(&mut journal, Refusal::Stale, |j| j.advance(gone, 9));
+    refuses(&mut journal, Refusal::Stale, |j| j.checkpoint(gone, 3, 9));
     // Nothing remembers a released pin: releasing it again is not provable.
-    refused(&mut journal, Refusal::Stale, |j| j.release(gone));
+    refuses(&mut journal, Refusal::Stale, |j| j.release(gone));
     // A journal that has issued no pin never issued this one.
     let mut other = fresh();
-    refused(&mut other, Refusal::Stale, |j| j.release(checkpoint));
-    refused(&mut journal, Refusal::WrongKind, |j| {
+    refuses(&mut other, Refusal::Stale, |j| j.release(checkpoint));
+    refuses(&mut journal, Refusal::WrongKind, |j| {
         j.advance(checkpoint, 9)
     });
-    refused(&mut journal, Refusal::WrongKind, |j| {
+    refuses(&mut journal, Refusal::WrongKind, |j| {
         j.checkpoint(reader, 3, 9)
     });
-    refused(&mut journal, Refusal::Regressed, |j| j.advance(reader, 4));
+    refuses(&mut journal, Refusal::Regressed, |j| j.advance(reader, 4));
     repeated(&mut journal, Advanced::Unchanged, |j| j.advance(reader, 5));
-    refused(&mut journal, Refusal::Unassigned, |j| {
+    refuses(&mut journal, Refusal::Unassigned, |j| {
         j.checkpoint(checkpoint, 0, 9)
     });
-    refused(&mut journal, Refusal::StaleAssignment, |j| {
+    refuses(&mut journal, Refusal::StaleAssignment, |j| {
         j.checkpoint(checkpoint, 2, 9)
     });
-    refused(&mut journal, Refusal::Regressed, |j| {
+    refuses(&mut journal, Refusal::Regressed, |j| {
         j.checkpoint(checkpoint, 3, 4)
     });
     repeated(&mut journal, Checkpointed::Unchanged, |j| {
@@ -143,16 +132,16 @@ fn replacement_refusals_change_nothing() {
         bytes: 1,
         live_records,
     };
-    refused(&mut journal, Refusal::Busy, |j| j.propose(sealed[0]));
-    refused(&mut journal, Refusal::Stale, |j| {
+    refuses(&mut journal, Refusal::Busy, |j| j.propose(sealed[0]));
+    refuses(&mut journal, Refusal::Stale, |j| {
         j.confirm_durable(old, Durable::Superseded)
     });
-    refused(&mut journal, Refusal::Stale, |j| j.reclaim(old));
-    refused(&mut journal, Refusal::Stale, |j| j.abort(old));
-    refused(&mut journal, Refusal::Exceeds, |j| {
+    refuses(&mut journal, Refusal::Stale, |j| j.reclaim(old));
+    refuses(&mut journal, Refusal::Stale, |j| j.abort(old));
+    refuses(&mut journal, Refusal::Exceeds, |j| {
         j.confirm_durable(current, rewritten(11))
     });
-    refused(&mut journal, Refusal::NotDurable, |j| j.reclaim(current));
+    refuses(&mut journal, Refusal::NotDurable, |j| j.reclaim(current));
     assert_eq!(
         journal.confirm_durable(current, rewritten(4)),
         Ok(Confirmed::Recorded)
@@ -160,20 +149,20 @@ fn replacement_refusals_change_nothing() {
     repeated(&mut journal, Confirmed::AlreadyDurable, |j| {
         j.confirm_durable(current, rewritten(4))
     });
-    refused(&mut journal, Refusal::Mismatch, |j| {
+    refuses(&mut journal, Refusal::Mismatch, |j| {
         j.confirm_durable(current, Durable::Superseded)
     });
-    refused(&mut journal, Refusal::Mismatch, |j| {
+    refuses(&mut journal, Refusal::Mismatch, |j| {
         j.confirm_durable(current, rewritten(11))
     });
-    refused(&mut journal, Refusal::Busy, |j| j.propose(sealed[0]));
+    refuses(&mut journal, Refusal::Busy, |j| j.propose(sealed[0]));
     let pin = journal.pin_reader(9).expect("pin");
-    refused(&mut journal, Refusal::Pinned { offset: 9 }, |j| {
+    refuses(&mut journal, Refusal::Pinned { offset: 9 }, |j| {
         j.reclaim(current)
     });
     assert_eq!(journal.release(pin), Ok(()));
     assert!(journal.reclaim(current).is_ok());
-    refused(&mut journal, Refusal::Stale, |j| j.reclaim(current));
+    refuses(&mut journal, Refusal::Stale, |j| j.reclaim(current));
 }
 
 #[test]

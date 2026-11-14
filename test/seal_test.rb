@@ -47,6 +47,58 @@ class SealTest < Minitest::Test
     end
   end
 
+  # A singleton class opened on a genuine Policy does not change what it is,
+  # a clone of one included.
+  def test_an_opened_singleton_class_is_still_the_gems_value
+    policy = J::Policy.new(100, nil, nil, 250).tap(&:singleton_class)
+    assert_equal policy, J::Journal.new(policy, 0, 0).policy
+    assert_equal policy, J::Journal.resumed(policy.clone, 0, 0, 1, 0).policy
+  end
+
+  # The extension reads a Policy's fields from the struct, never through its
+  # readers: a redefined reader is ignored.
+  def test_a_redefined_reader_is_ignored
+    policy = J::Policy.new(100, nil, nil, 250)
+    readers = %i[max_bytes min_dead_per_mille].to_h { [it, J::Policy.instance_method(it)] }
+    begin
+      J::Policy.define_method(:max_bytes) { 0 }
+      J::Policy.define_method(:min_dead_per_mille) { raise 'reader ran' }
+      journal = J::Journal.new(policy, 0, 0)
+    ensure
+      readers.each { |name, reader| J::Policy.define_method(name, reader) }
+    end
+    assert_equal policy, journal.policy
+  end
+
+  # The arrays the native hooks read are exactly Arrays: a subclass is a
+  # TypeError like any other subclass.
+  def test_an_array_subclass_is_refused
+    list = Class.new(Array)
+    head = [1, 0, 0, 0]
+    counts = [0, 0, 0, 0]
+    assert_raises(TypeError) { J::Journal.__send__(:__check_segment, list[*head], counts, :active, false, nil) }
+    assert_raises(TypeError) { J::Journal.__send__(:__check_segment, head, list[*counts], :active, false, nil) }
+    assert_raises(TypeError) { J::Journal.__send__(:__check_segment, head, [0, 0, 0], :active, false, nil) }
+    policy = J::Policy.new(nil, nil, nil, 500)
+    assert_raises(TypeError) { J::Journal.__send__(:__open, 0, 0, list[0, 0], policy) }
+    assert_raises(TypeError) { J::Journal.__send__(:__open, 0, 0, [0], policy) }
+    assert_equal 1, J::Journal.__send__(:__open, 0, 0, [0, 0], policy).issued
+  end
+
+  # A handle is read natively by its exact class; a singleton class opened
+  # on a genuine one changes nothing, and nothing else stands in for it.
+  def test_handles_are_read_by_exact_class
+    journal, = journal_with(1)
+    pin = journal.pin_reader(3).tap(&:singleton_class)
+    assert_equal 3, journal.pin_offset(pin)
+    assert_equal :moved, journal.advance(pin, 4)
+    replacement = journal.propose(1)
+    [replacement, Object.new, 1].each { |v| assert_raises(TypeError) { journal.advance(v, 5) } }
+    [pin, Object.new].each { |v| assert_raises(TypeError) { journal.abort(v) } }
+    assert_raises(TypeError) { journal.pin_offset(replacement) }
+    assert_equal :aborted, journal.abort(replacement.tap(&:singleton_class))
+  end
+
   # The classes the extension resolved at init are pinned: after a
   # compaction that moves what it can, every path that builds or reads a
   # value still finds them.

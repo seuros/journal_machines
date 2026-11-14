@@ -1,6 +1,7 @@
 //! Every identity the journal issues carries its scope.
 use std::vec::Vec;
 
+use matryona_machines::testing::refuses;
 use periscope_machines::{SEQUENCE_MAX, scope_of, scoped};
 
 use super::{Small, at, open, policy, worn};
@@ -190,13 +191,11 @@ fn scope_zero_issues_one_plain_counter() {
 
 /// Every call that issues is `Exhausted` and changes nothing.
 fn is_spent(journal: &mut Small, sealed: SegmentId) {
-    let before = journal.clone();
     assert_eq!(journal.issued(), SEQUENCE_MAX);
-    assert_eq!(journal.roll(1, 1, at(0)), Err(Refusal::Exhausted));
-    assert_eq!(journal.propose(sealed), Err(Refusal::Exhausted));
-    assert_eq!(journal.pin_reader(0), Err(Refusal::Exhausted));
-    assert_eq!(journal.pin_checkpoint(1, 0), Err(Refusal::Exhausted));
-    assert_eq!(*journal, before);
+    refuses(journal, Refusal::Exhausted, |j| j.roll(1, 1, at(0)));
+    refuses(journal, Refusal::Exhausted, |j| j.propose(sealed));
+    refuses(journal, Refusal::Exhausted, |j| j.pin_reader(0));
+    refuses(journal, Refusal::Exhausted, |j| j.pin_checkpoint(1, 0));
 }
 
 #[test]

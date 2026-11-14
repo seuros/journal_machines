@@ -7,16 +7,40 @@ mod init;
 mod values;
 
 use answers::reply;
-use classes::{classes, keep};
-use convert::{Number, Scope, answer, nanos, policy, policy_from};
+use classes::classes;
+use convert::{answer, policy, policy_from};
 use handles::{PinHandle, ReplacementHandle};
 
 use std::{cell::RefCell, num::NonZeroU64};
 
 use journal_machines::{
-    Advanced, Checkpointed, Confirmed, Durable, Pin, Refusal, Roll, Segment, SegmentId,
+    Advanced, Checkpointed, Confirmed, Durable, Pin, Refusal, Replacement, Roll, Segment, SegmentId,
 };
-use magnus::{Error, IntoValue, RArray, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
+use magnus::{Error, Integer, IntoValue, RArray, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
+use matryona_machines::ruby::{
+    Symbols, duration, exact_array_n, exact_typed, integer, keep, nanoseconds, symbol,
+};
+
+/// The pin exactly a `Pin` handle names; `TypeError` for anything else, a
+/// subclass instance included.
+fn pin(ruby: &Ruby, value: Value) -> Result<Pin, Error> {
+    let class = classes(ruby)?.pin.get(ruby);
+    let message = "expected a JournalMachines::Pin";
+    exact_typed::<PinHandle>(ruby, value, class, message).map(|handle| handle.pin)
+}
+
+/// The attempt exactly a `Replacement` handle names; `TypeError` for
+/// anything else, a subclass instance included.
+fn replacement(ruby: &Ruby, value: Value) -> Result<Replacement, Error> {
+    let class = classes(ruby)?.replacement.get(ruby);
+    let message = "expected a JournalMachines::Replacement";
+    exact_typed::<ReplacementHandle>(ruby, value, class, message).map(|handle| handle.replacement)
+}
+
+/// A segment id given as an Integer named `name`.
+fn id(value: Value, name: &str) -> Result<SegmentId, Error> {
+    integer(value, name).map(SegmentId::from_raw)
+}
 
 const SEGMENTS: usize = 64;
 
@@ -39,14 +63,17 @@ impl Journal {
     /// issued. Raises `RangeError` where the core answers `None`.
     fn open(
         ruby: &Ruby,
-        base_offset: Number,
-        now: Number,
-        (scope, issued): (Scope, Number),
+        base_offset: Value,
+        now: Value,
+        pair: Value,
         policy: Value,
     ) -> Result<Self, Error> {
+        let (base, now) = (integer(base_offset, "base_offset")?, duration(now, "now")?);
+        let [scope, issued] =
+            exact_array_n::<2>(ruby, pair, "scope and issued must be an Array of two")?;
+        let (scope, issued) = (integer(scope, "scope")?, integer(issued, "issued")?);
         let policy = policy_from(ruby, policy)?;
-        let (base, now) = (base_offset.0, now.nanos());
-        journal_machines::Journal::resumed(policy, base, now, scope.0, issued.0)
+        journal_machines::Journal::resumed(policy, base, now, scope, issued)
             .map(|core| Self {
                 core: RefCell::new(core),
             })
@@ -69,21 +96,21 @@ impl Journal {
     /// Raises where `Policy::new` answers `None`; `Policy.new` calls it.
     fn check_policy(
         ruby: &Ruby,
-        max_bytes: Option<Number>,
-        max_records: Option<Number>,
-        max_age: Option<Number>,
-        min_dead_per_mille: Number,
+        max_bytes: Option<Value>,
+        max_records: Option<Value>,
+        max_age: Option<Value>,
+        min_dead_per_mille: Value,
     ) -> Result<(), Error> {
-        policy(ruby, max_bytes, max_records, max_age, min_dead_per_mille).map(|_| ())
+        policy(ruby, max_bytes, max_records, max_age, min_dead_per_mille).map(drop)
     }
 
     /// The four `Policy` fields, in order.
-    fn policy(&self) -> (Option<u64>, Option<u64>, Option<u64>, u16) {
-        let policy = self.core.borrow().policy();
+    fn policy(ruby: &Ruby, this: &Self) -> (Option<u64>, Option<u64>, Option<Integer>, u16) {
+        let policy = this.core.borrow().policy();
         (
             policy.max_bytes().map(NonZeroU64::get),
             policy.max_records().map(NonZeroU64::get),
-            policy.max_age().map(nanos),
+            policy.max_age().map(|age| nanoseconds(ruby, age)),
             policy.min_dead_per_mille(),
         )
     }
@@ -100,46 +127,44 @@ impl Journal {
     fn roll_decision(
         ruby: &Ruby,
         this: &Self,
-        bytes: Number,
-        records: Number,
-        now: Number,
+        bytes: Value,
+        records: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let due = classes(ruby)?.due;
-        let decision = this
-            .core
-            .borrow()
-            .roll_decision(bytes.0, records.0, now.nanos());
+        let (bytes, records) = (integer(bytes, "bytes")?, integer(records, "records")?);
+        let now = duration(now, "now")?;
+        let due = classes(ruby)?.due.get(ruby);
+        let decision = this.core.borrow().roll_decision(bytes, records, now);
         reply(ruby, decision, |roll| match roll {
-            Roll::Keep => Ok(ruby.to_symbol("keep").as_value()),
-            Roll::Due(reason) => due.funcall("new", (ruby.to_symbol(answers::reason(reason)),)),
+            Roll::Keep => Ok(symbol(ruby, "keep").as_value()),
+            Roll::Due(reason) => due.funcall("new", (answers::Reasons::symbol(ruby, reason),)),
         })
     }
 
     fn roll(
         ruby: &Ruby,
         this: Obj<Self>,
-        bytes: Number,
-        records: Number,
-        now: Number,
+        bytes: Value,
+        records: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let class = classes(ruby)?.rolled;
-        keep(ruby, this.as_value(), &this.core, |core| {
-            let rolled = core.roll(bytes.0, records.0, now.nanos());
-            reply(ruby, rolled, |rolled| answers::rolled(class, rolled))
-        })
+        this.check_frozen()?;
+        let (bytes, records) = (integer(bytes, "bytes")?, integer(records, "records")?);
+        let now = duration(now, "now")?;
+        let class = classes(ruby)?.rolled.get(ruby);
+        keep(
+            ruby,
+            this,
+            &this.core,
+            |core| core.roll(bytes, records, now),
+            |rolled| reply(ruby, rolled, |rolled| answers::rolled(class, rolled)),
+        )
     }
 
-    fn observe_live(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        id: Number,
-        live: Number,
-    ) -> Result<Symbol, Error> {
+    fn observe_live(ruby: &Ruby, this: Obj<Self>, id: Value, live: Value) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let outcome = this
-            .core
-            .borrow_mut()
-            .observe_live(SegmentId::from_raw(id.0), live.0);
+        let (id, live) = (self::id(id, "id")?, integer(live, "live_records")?);
+        let outcome = this.core.borrow_mut().observe_live(id, live);
         Ok(answer(ruby, outcome, |()| "recorded"))
     }
 
@@ -149,7 +174,7 @@ impl Journal {
         this: &Self,
         read: impl FnOnce(&journal_machines::Journal<SEGMENTS, PINS>) -> Option<Segment>,
     ) -> Result<Option<Value>, Error> {
-        let class = classes(ruby)?.segment;
+        let class = classes(ruby)?.segment.get(ruby);
         let segment = read(&this.core.borrow());
         segment
             .map(|segment| answers::segment(ruby, class, segment))
@@ -160,12 +185,14 @@ impl Journal {
         Self::view(ruby, this, journal_machines::Journal::active)
     }
 
-    fn segment(ruby: &Ruby, this: &Self, id: Number) -> Result<Option<Value>, Error> {
-        Self::view(ruby, this, |core| core.segment(SegmentId::from_raw(id.0)))
+    fn segment(ruby: &Ruby, this: &Self, id: Value) -> Result<Option<Value>, Error> {
+        let id = self::id(id, "id")?;
+        Self::view(ruby, this, |core| core.segment(id))
     }
 
-    fn covering(ruby: &Ruby, this: &Self, offset: Number) -> Result<Option<Value>, Error> {
-        Self::view(ruby, this, |core| core.covering(offset.0))
+    fn covering(ruby: &Ruby, this: &Self, offset: Value) -> Result<Option<Value>, Error> {
+        let offset = integer(offset, "offset")?;
+        Self::view(ruby, this, |core| core.covering(offset))
     }
 
     /// At most `limit` rows (clamped to the capacity) of one scan after
@@ -174,13 +201,14 @@ impl Journal {
     fn scan(
         ruby: &Ruby,
         this: &Self,
-        after: Option<Number>,
-        limit: Number,
+        after: Option<Value>,
+        limit: Value,
         scan: Scan,
     ) -> Result<RArray, Error> {
-        let take = usize::try_from(limit.0).map_or(SEGMENTS, |limit| limit.min(SEGMENTS));
-        let after = after.map(|after| SegmentId::from_raw(after.0));
-        let class = classes(ruby)?.segment;
+        let after = after.map(|after| id(after, "after")).transpose()?;
+        let limit: u64 = integer(limit, "limit")?;
+        let take = usize::try_from(limit).map_or(SEGMENTS, |limit| limit.min(SEGMENTS));
+        let class = classes(ruby)?.segment.get(ruby);
         let views: Vec<Segment> = {
             let core = this.core.borrow();
             match scan {
@@ -199,8 +227,8 @@ impl Journal {
     fn segments(
         ruby: &Ruby,
         this: &Self,
-        after: Option<Number>,
-        limit: Number,
+        after: Option<Value>,
+        limit: Value,
     ) -> Result<RArray, Error> {
         Self::scan(ruby, this, after, limit, Scan::All)
     }
@@ -208,8 +236,8 @@ impl Journal {
     fn compaction_candidates(
         ruby: &Ruby,
         this: &Self,
-        after: Option<Number>,
-        limit: Number,
+        after: Option<Value>,
+        limit: Value,
     ) -> Result<RArray, Error> {
         Self::scan(ruby, this, after, limit, Scan::Candidates)
     }
@@ -217,8 +245,8 @@ impl Journal {
     fn reclaimable(
         ruby: &Ruby,
         this: &Self,
-        after: Option<Number>,
-        limit: Number,
+        after: Option<Value>,
+        limit: Value,
     ) -> Result<RArray, Error> {
         Self::scan(ruby, this, after, limit, Scan::Reclaimable)
     }
@@ -227,34 +255,35 @@ impl Journal {
         reply(ruby, pin, |pin| Ok(PinHandle { pin }.into_value_with(ruby)))
     }
 
-    fn pin_reader(ruby: &Ruby, this: Obj<Self>, offset: Number) -> Result<Value, Error> {
+    fn pin_reader(ruby: &Ruby, this: Obj<Self>, offset: Value) -> Result<Value, Error> {
         this.check_frozen()?;
-        let pin = this.core.borrow_mut().pin_reader(offset.0);
+        let offset = integer(offset, "offset")?;
+        let pin = this.core.borrow_mut().pin_reader(offset);
         Self::pinned(ruby, pin)
     }
 
     fn pin_checkpoint(
         ruby: &Ruby,
         this: Obj<Self>,
-        assignment: Number,
-        offset: Number,
+        assignment: Value,
+        offset: Value,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let pin = this
-            .core
-            .borrow_mut()
-            .pin_checkpoint(assignment.0, offset.0);
+        let assignment = integer(assignment, "assignment")?;
+        let offset = integer(offset, "offset")?;
+        let pin = this.core.borrow_mut().pin_checkpoint(assignment, offset);
         Self::pinned(ruby, pin)
     }
 
     fn advance(
         ruby: &Ruby,
         this: Obj<Self>,
-        handle: Obj<PinHandle>,
-        offset: Number,
+        handle: Value,
+        offset: Value,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let outcome = this.core.borrow_mut().advance(handle.pin, offset.0);
+        let (pin, offset) = (pin(ruby, handle)?, integer(offset, "offset")?);
+        let outcome = this.core.borrow_mut().advance(pin, offset);
         Ok(answer(ruby, outcome, |advanced| match advanced {
             Advanced::Unchanged => "unchanged",
             Advanced::Moved => "moved",
@@ -264,15 +293,14 @@ impl Journal {
     fn checkpoint(
         ruby: &Ruby,
         this: Obj<Self>,
-        handle: Obj<PinHandle>,
-        assignment: Number,
-        offset: Number,
+        handle: Value,
+        assignment: Value,
+        offset: Value,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let outcome = this
-            .core
-            .borrow_mut()
-            .checkpoint(handle.pin, assignment.0, offset.0);
+        let (pin, assignment) = (pin(ruby, handle)?, integer(assignment, "assignment")?);
+        let offset = integer(offset, "offset")?;
+        let outcome = this.core.borrow_mut().checkpoint(pin, assignment, offset);
         Ok(answer(ruby, outcome, |checkpointed| match checkpointed {
             Checkpointed::Reassigned => "reassigned",
             Checkpointed::Unchanged => "unchanged",
@@ -280,14 +308,16 @@ impl Journal {
         }))
     }
 
-    fn release(ruby: &Ruby, this: Obj<Self>, handle: Obj<PinHandle>) -> Result<Symbol, Error> {
+    fn release(ruby: &Ruby, this: Obj<Self>, handle: Value) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let outcome = this.core.borrow_mut().release(handle.pin);
+        let pin = pin(ruby, handle)?;
+        let outcome = this.core.borrow_mut().release(pin);
         Ok(answer(ruby, outcome, |()| "released"))
     }
 
-    fn pin_offset(&self, handle: Obj<PinHandle>) -> Option<u64> {
-        self.core.borrow().pin_offset(handle.pin)
+    fn pin_offset(ruby: &Ruby, this: &Self, handle: Value) -> Result<Option<u64>, Error> {
+        let pin = pin(ruby, handle)?;
+        Ok(this.core.borrow().pin_offset(pin))
     }
 
     fn low_pin(&self) -> Option<u64> {
@@ -298,74 +328,67 @@ impl Journal {
         self.core.borrow().pins()
     }
 
-    fn propose(ruby: &Ruby, this: Obj<Self>, id: Number) -> Result<Value, Error> {
+    fn propose(ruby: &Ruby, this: Obj<Self>, id: Value) -> Result<Value, Error> {
         this.check_frozen()?;
-        let proposed = this.core.borrow_mut().propose(SegmentId::from_raw(id.0));
+        let id = self::id(id, "id")?;
+        let proposed = this.core.borrow_mut().propose(id);
         reply(ruby, proposed, |replacement| {
             Ok(ReplacementHandle { replacement }.into_value_with(ruby))
         })
     }
 
-    fn confirm(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        handle: Obj<ReplacementHandle>,
-        durable: Durable,
-    ) -> Result<Symbol, Error> {
-        this.check_frozen()?;
-        let outcome = this
-            .core
-            .borrow_mut()
-            .confirm_durable(handle.replacement, durable);
-        Ok(answer(ruby, outcome, |confirmed| match confirmed {
+    /// Called once the receiver is known mutable and the arguments read.
+    fn confirm(ruby: &Ruby, this: Obj<Self>, handle: Replacement, durable: Durable) -> Symbol {
+        let outcome = this.core.borrow_mut().confirm_durable(handle, durable);
+        answer(ruby, outcome, |confirmed| match confirmed {
             Confirmed::AlreadyDurable => "already_durable",
             Confirmed::Recorded => "recorded",
-        }))
+        })
     }
 
     fn confirm_rewritten(
         ruby: &Ruby,
         this: Obj<Self>,
-        handle: Obj<ReplacementHandle>,
-        bytes: Number,
-        live_records: Number,
-    ) -> Result<Symbol, Error> {
-        let durable = Durable::Rewritten {
-            bytes: bytes.0,
-            live_records: live_records.0,
-        };
-        Self::confirm(ruby, this, handle, durable)
-    }
-
-    fn confirm_superseded(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        handle: Obj<ReplacementHandle>,
-    ) -> Result<Symbol, Error> {
-        Self::confirm(ruby, this, handle, Durable::Superseded)
-    }
-
-    fn reclaim(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        handle: Obj<ReplacementHandle>,
-    ) -> Result<Value, Error> {
-        let class = classes(ruby)?.reclaimed;
-        keep(ruby, this.as_value(), &this.core, |core| {
-            let outcome = core.reclaim(handle.replacement);
-            reply(ruby, outcome, |reclaimed| {
-                answers::reclaimed(class, reclaimed)
-            })
-        })
-    }
-
-    fn abort(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        handle: Obj<ReplacementHandle>,
+        handle: Value,
+        bytes: Value,
+        live_records: Value,
     ) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        let outcome = this.core.borrow_mut().abort(handle.replacement);
+        let handle = replacement(ruby, handle)?;
+        let durable = Durable::Rewritten {
+            bytes: integer(bytes, "bytes")?,
+            live_records: integer(live_records, "live_records")?,
+        };
+        Ok(Self::confirm(ruby, this, handle, durable))
+    }
+
+    fn confirm_superseded(ruby: &Ruby, this: Obj<Self>, handle: Value) -> Result<Symbol, Error> {
+        this.check_frozen()?;
+        let handle = replacement(ruby, handle)?;
+        Ok(Self::confirm(ruby, this, handle, Durable::Superseded))
+    }
+
+    fn reclaim(ruby: &Ruby, this: Obj<Self>, handle: Value) -> Result<Value, Error> {
+        this.check_frozen()?;
+        let handle = replacement(ruby, handle)?;
+        let class = classes(ruby)?.reclaimed.get(ruby);
+        keep(
+            ruby,
+            this,
+            &this.core,
+            |core| core.reclaim(handle),
+            |outcome| {
+                reply(ruby, outcome, |reclaimed| {
+                    answers::reclaimed(class, reclaimed)
+                })
+            },
+        )
+    }
+
+    fn abort(ruby: &Ruby, this: Obj<Self>, handle: Value) -> Result<Symbol, Error> {
+        this.check_frozen()?;
+        let handle = replacement(ruby, handle)?;
+        let outcome = this.core.borrow_mut().abort(handle);
         Ok(answer(ruby, outcome, |()| "aborted"))
     }
 }

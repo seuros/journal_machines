@@ -2,25 +2,18 @@
 use core::num::NonZeroU64;
 use std::vec::Vec;
 
+use matryona_machines::testing::XorShift64;
 use periscope_machines::scoped;
 
 use super::at;
 use super::model::{Model, PINS, Real};
 use crate::*;
 
-struct Rng(u64);
+type Rng = XorShift64;
 
-impl Rng {
-    fn below(&mut self, bound: u64) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 >> 11) % bound
-    }
-
-    fn index(&mut self, len: usize) -> usize {
-        usize::try_from(self.below(len as u64)).expect("index")
-    }
+/// A draw in `0..len`, as an index.
+fn index(rng: &mut Rng, len: usize) -> usize {
+    usize::try_from(rng.below(len as u64)).expect("index")
 }
 
 fn compare(real: &Real, model: &Model, rng: &mut Rng) {
@@ -112,7 +105,7 @@ fn stranger(foreign: &mut Real, known: &mut Vec<Pin>, issued: u64, rng: &mut Rng
             known.remove(0);
         }
     }
-    known[rng.index(known.len())]
+    known[index(rng, known.len())]
 }
 
 /// What a repeat of an already-confirmed attempt carries: now and then the
@@ -159,9 +152,9 @@ fn outside(handle: Replacement, rng: &mut Rng) -> Replacement {
 
 #[allow(clippy::too_many_lines)]
 fn run(seed: u64, steps: usize, scope: u16, start: u64, tally: &mut Seen) {
-    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let mut rng = Rng::new(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let limits = [rng.below(3) * 20, rng.below(3) * 2, rng.below(3) * 4];
-    let per_mille = [0, 250, 500, 1000][rng.index(4)];
+    let per_mille = [0, 250, 500, 1000][index(&mut rng, 4)];
     let policy = Policy::new(
         NonZeroU64::new(limits[0]),
         NonZeroU64::new(limits[1]),
@@ -208,7 +201,7 @@ fn run(seed: u64, steps: usize, scope: u16, start: u64, tally: &mut Seen) {
                 &mut rng,
             ))
         } else {
-            pins.get(rng.index(pins.len() + 1)).copied()
+            pins.get(index(&mut rng, pins.len() + 1)).copied()
         };
         // One pin and one handle in six come from another scope.
         let pin = pin.map(|pin| {
@@ -218,7 +211,7 @@ fn run(seed: u64, steps: usize, scope: u16, start: u64, tally: &mut Seen) {
                 pin
             }
         });
-        let handle = handles.get(rng.index(handles.len() + 1)).copied();
+        let handle = handles.get(index(&mut rng, handles.len() + 1)).copied();
         let handle = handle.map(|handle| {
             if rng.below(6) == 0 {
                 outside(handle, &mut rng)

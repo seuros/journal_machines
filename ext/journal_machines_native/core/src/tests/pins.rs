@@ -1,4 +1,5 @@
 //! Pins, reclamation gating and integer limits.
+use matryona_machines::testing::{refuses, unchanged};
 use offset_machines::{Ack, Commit, Tracker};
 
 use super::{Small, at, ids, journal_with, policy};
@@ -23,12 +24,9 @@ fn reclaim_waits_for_every_pin_of_either_kind() {
     let view = journal.segment(sealed[0]).expect("segment");
     assert_eq!((view.state, view.pinned), (SegmentState::Durable, true));
     assert_eq!(journal.reclaimable(None).count(), 0);
-    let before = journal.clone();
-    assert_eq!(
-        journal.reclaim(replacement),
-        Err(Refusal::Pinned { offset: 3 })
-    );
-    assert_eq!(journal, before);
+    refuses(&mut journal, Refusal::Pinned { offset: 3 }, |j| {
+        j.reclaim(replacement)
+    });
     assert_eq!(journal.advance(reader, 9), Ok(Advanced::Moved));
     assert_eq!(
         journal.reclaim(replacement),
@@ -79,12 +77,10 @@ fn tracker_committed_base_drives_the_checkpoint_pin() {
     for offset in 0..10 {
         assert_eq!(tracker.ack(1, offset), Ok(Ack::Recorded));
     }
-    let before = journal.clone();
     assert_eq!(
-        journal.checkpoint_from(pin, &tracker),
+        unchanged(&mut journal, |j| j.checkpoint_from(pin, &tracker)),
         Ok(Checkpointed::Unchanged)
     );
-    assert_eq!(journal, before);
     assert_eq!(
         journal.reclaim(replacement),
         Err(Refusal::Pinned { offset: 0 }),

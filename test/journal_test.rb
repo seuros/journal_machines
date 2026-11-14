@@ -297,4 +297,23 @@ class JournalTest < Minitest::Test
     assert_equal :keep, journal.roll_decision(1, 1, 0)
     assert_equal 2, journal.segments(nil, 64).size
   end
+
+  # Frozen is checked before any argument is read: a frozen journal handed a
+  # malformed argument raises FrozenError, as Ruby's own core methods do.
+  def test_frozen_is_checked_before_the_arguments
+    journal, = journal_with(1)
+    journal.freeze
+    assert_raises(FrozenError) { journal.roll(1.5, 1, 0) }
+    assert_raises(FrozenError) { journal.observe_live(-1, 0) }
+    assert_raises(FrozenError) { journal.pin_reader('0') }
+    assert_raises(FrozenError) { journal.pin_checkpoint(1, nil) }
+    assert_raises(FrozenError) { journal.advance(nil, 1) }
+    assert_raises(FrozenError) { journal.checkpoint(Object.new, 1, 1) }
+    assert_raises(FrozenError) { journal.release(:pin) }
+    assert_raises(FrozenError) { journal.propose(2**64) }
+    assert_raises(FrozenError) { journal.confirm_superseded(nil) }
+    assert_raises(FrozenError) { journal.confirm_rewritten(nil, 1.0, 1) }
+    assert_raises(FrozenError) { journal.reclaim(1) }
+    assert_raises(FrozenError) { journal.abort(1) }
+  end
 end

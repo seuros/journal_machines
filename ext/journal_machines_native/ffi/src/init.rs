@@ -21,7 +21,6 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("JournalMachines")?;
     module.const_set("SEGMENT_CAPACITY", SEGMENTS)?;
     module.const_set("PIN_CAPACITY", PINS)?;
-    crate::classes::resolve(ruby, module)?;
     let pin = module.define_class("Pin", ruby.class_object())?;
     pin.undef_default_alloc_func();
     pin.define_method("kind", method!(PinHandle::kind, 0))?;
@@ -34,6 +33,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     replacement.define_method("attempt", method!(ReplacementHandle::attempt, 0))?;
     replacement.define_method("scope", method!(ReplacementHandle::scope, 0))?;
     value_object!(replacement, ReplacementHandle);
+    crate::classes::resolve(ruby, module, pin, replacement)?;
     let class = module.define_class("Journal", ruby.class_object())?;
     class.undef_default_alloc_func();
     class.define_singleton_method("__open", function!(Journal::open, 4))?;

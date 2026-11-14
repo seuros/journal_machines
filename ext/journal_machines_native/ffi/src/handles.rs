@@ -2,6 +2,7 @@
 //! they carry, so two answers naming the same pin or attempt are `==`.
 use journal_machines::{Pin, PinKind, Replacement};
 use magnus::{Ruby, Symbol};
+use matryona_machines::ruby::symbol;
 
 #[derive(PartialEq, Eq, Hash)]
 #[magnus::wrap(class = "JournalMachines::Pin", free_immediately, size)]
@@ -11,10 +12,11 @@ pub struct PinHandle {
 
 impl PinHandle {
     pub fn kind(ruby: &Ruby, this: &Self) -> Symbol {
-        ruby.to_symbol(match this.pin.kind() {
+        let name = match this.pin.kind() {
             PinKind::Reader => "reader",
             PinKind::Checkpoint => "checkpoint",
-        })
+        };
+        symbol(ruby, name)
     }
 
     pub const fn generation(&self) -> u64 {
