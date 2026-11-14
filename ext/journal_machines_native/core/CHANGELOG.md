@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/seuros/journal_machines/compare/journal-machines-v0.6.0...journal-machines-v0.7.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* adopt matryona-machines 0.2: exact-class Pin/Replacement handles, positive thresholds, compiler-checked symbol tables
+
+### Features
+
+* adopt matryona-machines 0.2: exact-class Pin/Replacement handles, positive thresholds, compiler-checked symbol tables ([53ef3b1](https://github.com/seuros/journal_machines/commit/53ef3b10ded3b1b994e2da14f04ecd5dcf5c7a7c))
+
 ## [0.6.0](https://github.com/seuros/journal_machines/compare/journal-machines-v0.5.0...journal-machines-v0.6.0) (2026-11-14)
 
 
