@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/seuros/journal_machines/compare/journal_machines/v0.7.0...journal_machines/v0.7.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* fix wrapped classes at load so building a handle runs no Ruby ([f87e049](https://github.com/seuros/journal_machines/commit/f87e049d521da4c49f9b160a5247c2a94307aaf5))
+
 ## [0.7.0](https://github.com/seuros/journal_machines/compare/journal_machines/v0.6.1...journal_machines/v0.7.0) (2026-11-16)
 
 
