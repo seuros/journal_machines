@@ -4,7 +4,7 @@
 
 Engine-room flight manual: know which log segments exist, and which may go.
 
-Initial, unstable. Allocation-free `no_std` segment metadata policy for a
+Pre-1.0. Allocation-free `no_std` segment metadata policy for a
 segmented log: when the active segment should roll, which sealed segments are
 worth compacting, and when an original may be deleted.
 
@@ -29,14 +29,17 @@ record and byte counts, ids, revisions and generations are `u64`.
 
 - `Rolled::new(sealed, opened, next_offset)`, `Reclaimed::new(segment,
   revision, bytes, replaced_by)` and `Segment::new(id, revision, base_offset,
-  records, stored_records, live_records, bytes, opened_at, state, pinned,
-  replacement)` answer `Some` only for a value some journal could have
+  records, stored_records, live_records, bytes, opened_at, state,
+  retention, replacement)` answer `Some` only for a value some journal could have
   answered (issued ids of one scope, revisions and attempts drawn after their
   segment, a segment whose counts, state, pin and replacement agree). Their
   fields are private: read them through the accessor of the same name, so no
   value skips the check.
 - `SegmentId`, `Pin` and `Replacement` are values: two handles to the same
-  identity are equal and hash alike.
+  identity are equal and hash alike. They have no order: an id carries its
+  journal's scope, so ids of two journals compare by nothing meaningful.
+- `Segment::retention` is `Retention::Pinned` while a pin sits below the
+  segment's end, otherwise `Retention::Unpinned` (always, while active).
 - `Policy::new(max_bytes, max_records, max_age, min_dead_per_mille)` takes
   `Option<NonZeroU64>` sizes and an `Option<Duration>` age; `None` disables a
   threshold. It answers `None` for a per-mille above 1000 or a zero age.

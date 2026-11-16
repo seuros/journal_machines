@@ -48,27 +48,29 @@ class ValuesTest < Minitest::Test
     [proposed, plain, active].each { |segment| assert_equal segment, J::Segment.new(*segment.deconstruct) }
     assert_equal active, J::Segment.new(**active.to_h)
     bad = [
-      active.to_h.merge(records: 1), active.to_h.merge(pinned: true), active.to_h.merge(replacement: handle),
+      active.to_h.merge(records: 1), active.to_h.merge(retention: :pinned), active.to_h.merge(replacement: handle),
       plain.to_h.merge(stored_records: 11), plain.to_h.merge(live_records: 11), plain.to_h.merge(id: 0),
       plain.to_h.merge(state: :proposed), proposed.to_h.merge(replacement: nil), proposed.to_h.merge(state: :durable),
-      plain.to_h.merge(state: :nope)
+      plain.to_h.merge(state: :nope), plain.to_h.merge(retention: :nope)
     ]
     bad.each { |fields| assert_raises(RangeError, fields.inspect) { J::Segment.new(**fields) } }
   end
 
   def test_a_segment_raises_type_error_for_a_wrong_type
     active = open_journal.active
-    [{ pinned: nil }, { pinned: 1 }, { state: 'active' }, { replacement: 5 }, { bytes: 1.0 }, { opened_at: nil }]
-      .each { |change| assert_raises(TypeError, change.inspect) { J::Segment.new(**active.to_h, **change) } }
+    changes = [{ retention: nil }, { retention: true }, { state: 'active' }, { replacement: 5 }, { bytes: 1.0 },
+               { opened_at: nil }]
+    changes.each { |change| assert_raises(TypeError, change.inspect) { J::Segment.new(**active.to_h, **change) } }
     assert_raises(RangeError) { active.with(records: 1) }
   end
 
-  def test_pinned_is_exactly_true_or_false
+  def test_retention_is_exactly_a_retention_symbol
     active = open_journal.active
-    [nil, 0, 'true', :true].each do |flag|
-      error = assert_raises(TypeError, flag.inspect) { J::Segment.new(**active.to_h, pinned: flag) }
-      assert_equal 'pinned must be true or false', error.message
+    assert_equal :unpinned, active.retention
+    [nil, false, true, 'pinned'].each do |flag|
+      assert_raises(TypeError, flag.inspect) { J::Segment.new(**active.to_h, retention: flag) }
     end
+    assert_raises(RangeError) { J::Segment.new(**active.to_h, retention: :nope) }
   end
 
   def test_a_cursor_is_an_identity_this_journal_issued
@@ -118,5 +120,51 @@ class ValuesTest < Minitest::Test
     pin = journal.pin_reader(0)
     assert_raises(IOError) { journal.checkpoint_from(pin, exploding) }
     assert_equal 0, journal.pin_offset(pin)
+  end
+
+  # A tracker is a sibling gem's value, read natively by its public readers:
+  # a missing one is named before any reader runs.
+  def test_a_tracker_is_read_natively_by_its_public_readers
+    journal = open_journal
+    calls = []
+    partial = Object.new
+    partial.define_singleton_method(:generation) { calls << :generation && 0 }
+    error = assert_raises(TypeError) { journal.pin_checkpoint_from(partial) }
+    assert_equal 'expected an offset tracker responding to #generation and #base, Object lacks #base', error.message
+    assert_empty calls
+    error = assert_raises(TypeError) { journal.pin_checkpoint_from(5) }
+    assert_equal 'expected an offset tracker responding to #generation and #base, Integer lacks #generation',
+                 error.message
+
+    pin = journal.pin_checkpoint_from(Tracker.new(1, 1))
+    assert_equal 1, journal.pin_offset(pin)
+    assert_equal :advanced, journal.checkpoint_from(pin, Tracker.new(1, 5))
+    assert_equal 5, journal.pin_offset(pin)
+  end
+
+  # `respond_to?` is asked, so one that lies is believed: denying a reader the
+  # tracker has refuses it; claiming one it lacks runs into NoMethodError.
+  def test_a_lying_respond_to_is_believed
+    journal = open_journal
+    denying = Object.new
+    def denying.generation = 1
+    def denying.base = 1
+    def denying.respond_to?(*) = false
+    assert_raises(TypeError) { journal.pin_checkpoint_from(denying) }
+    claiming = Object.new
+    def claiming.generation = 1
+    def claiming.respond_to?(*) = true
+    assert_raises(NoMethodError) { journal.pin_checkpoint_from(claiming) }
+    assert_equal 0, journal.pins
+  end
+
+  def test_a_private_reader_is_missing
+    journal = open_journal
+    tracker = Object.new
+    def tracker.generation = 0
+    tracker.define_singleton_method(:base) { 1 }
+    tracker.singleton_class.send(:private, :base)
+    error = assert_raises(TypeError) { journal.pin_checkpoint_from(tracker) }
+    assert_includes error.message, 'lacks #base'
   end
 end

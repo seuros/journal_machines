@@ -4,7 +4,7 @@ use core::time::Duration;
 
 use periscope_machines::{scope_of, sequence_of};
 
-use crate::{Reclaimed, Replacement, Rolled, Segment, SegmentId, SegmentState};
+use crate::{Reclaimed, Replacement, Retention, Rolled, Segment, SegmentId, SegmentState};
 
 /// Whether `raw` is a number a journal issues: its sequence is not zero.
 const fn issued(raw: u64) -> bool {
@@ -81,7 +81,7 @@ impl Segment {
     ///
     /// The id is issued and the revision is zero or an attempt drawn after
     /// it. An active segment holds nothing yet: no revision, records, stored
-    /// or live records, bytes, pin or replacement. A closed one holds at least
+    /// or live records, bytes, pin (it is [`Retention::Unpinned`]) or replacement. A closed one holds at least
     /// one record within `u64` offsets, stores no more than its range and has
     /// no more live records than it stores. `Sealed` has no replacement; the
     /// other three have one on this segment, drawn after its revision.
@@ -99,7 +99,7 @@ impl Segment {
         bytes: u64,
         opened_at: Duration,
         state: SegmentState,
-        pinned: bool,
+        retention: Retention,
         replacement: Option<Replacement>,
     ) -> Option<Self> {
         Self {
@@ -112,7 +112,7 @@ impl Segment {
             bytes,
             opened_at,
             state,
-            pinned,
+            retention,
             replacement,
         }
         .checked()
@@ -128,6 +128,7 @@ impl Segment {
             None => true,
         };
         let replaced = self.replacement.is_some();
+        let pinned = matches!(self.retention, Retention::Pinned);
         let closed = self.records > 0
             && self.base_offset.checked_add(self.records).is_some()
             && self.stored_records <= self.records
@@ -139,13 +140,13 @@ impl Segment {
                     && self.stored_records == 0
                     && self.live_records == 0
                     && self.bytes == 0
-                    && !self.pinned
+                    && !pinned
                     && !replaced
             }
             SegmentState::Sealed => closed && !replaced,
             SegmentState::Proposed => closed && replaced,
-            SegmentState::Durable => closed && replaced && self.pinned,
-            SegmentState::Reclaimable => closed && replaced && !self.pinned,
+            SegmentState::Durable => closed && replaced && pinned,
+            SegmentState::Reclaimable => closed && replaced && !pinned,
         };
         if issued(self.id.raw()) && revision_of(self.id, self.revision) && attempt && state {
             Some(self)

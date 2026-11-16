@@ -18,6 +18,15 @@ pub enum SegmentState {
     Reclaimable,
 }
 
+/// Whether any pin retains part of a segment's range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retention {
+    /// No pin sits below the segment's end; always so while active.
+    Unpinned,
+    /// A pin sits below the segment's end and retains part of its range.
+    Pinned,
+}
+
 /// Point-in-time view of one segment's metadata.
 ///
 /// A value exists only when some journal could have answered it: build one
@@ -33,7 +42,7 @@ pub struct Segment {
     pub(crate) bytes: u64,
     pub(crate) opened_at: Duration,
     pub(crate) state: SegmentState,
-    pub(crate) pinned: bool,
+    pub(crate) retention: Retention,
     pub(crate) replacement: Option<Replacement>,
 }
 
@@ -92,10 +101,11 @@ impl Segment {
         self.state
     }
 
-    /// Whether any pin retains part of the range; always false while active.
+    /// Whether any pin retains part of the range; always
+    /// [`Retention::Unpinned`] while active.
     #[must_use]
-    pub const fn pinned(&self) -> bool {
-        self.pinned
+    pub const fn retention(&self) -> Retention {
+        self.retention
     }
 
     /// The replacement attempt in flight, if any.
@@ -107,6 +117,7 @@ impl Segment {
     /// One past the last offset of the range.
     #[must_use]
     pub const fn end_offset(&self) -> u64 {
+        // Copied from a slot whose `base + span` was checked when it sealed.
         self.base_offset + self.records
     }
 }

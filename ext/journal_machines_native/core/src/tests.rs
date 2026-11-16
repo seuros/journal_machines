@@ -1,4 +1,3 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
 use core::{num::NonZeroU64, time::Duration};
 use std::vec::Vec;
 

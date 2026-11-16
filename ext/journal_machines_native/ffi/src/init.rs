@@ -63,6 +63,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("pin_checkpoint", method!(Journal::pin_checkpoint, 2))?;
     class.define_method("advance", method!(Journal::advance, 2))?;
     class.define_method("checkpoint", method!(Journal::checkpoint, 3))?;
+    class.define_method(
+        "pin_checkpoint_from",
+        method!(Journal::pin_checkpoint_from, 1),
+    )?;
+    class.define_method("checkpoint_from", method!(Journal::checkpoint_from, 2))?;
     class.define_method("release", method!(Journal::release, 1))?;
     class.define_method("pin_offset", method!(Journal::pin_offset, 1))?;
     class.define_method("low_pin", method!(Journal::low_pin, 0))?;

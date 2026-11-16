@@ -242,6 +242,8 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
 
     /// Drop the tracked segment at `index`, shifting the later ones down so
     /// the tracked slots stay a prefix.
+    /// `index` comes from `locate`, which only answers indices below `len`,
+    /// so `len` is at least one and the decrement cannot wrap.
     fn remove(&mut self, index: usize) {
         let mut hole: Option<&mut Option<Slot>> = None;
         for entry in self.slots.iter_mut().take(self.len).skip(index) {

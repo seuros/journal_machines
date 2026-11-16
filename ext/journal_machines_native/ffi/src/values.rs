@@ -3,12 +3,12 @@
 use journal_machines::{Reclaimed, Rolled, Segment, SegmentId};
 use magnus::{Error, Ruby, Value};
 use matryona_machines::ruby::{
-    Symbols, boolean, duration, exact_array_n, integer, optional, optional_typed,
+    Symbols, duration, exact_array_n, integer, optional, optional_typed,
 };
 
 use crate::{
     ReplacementHandle,
-    answers::{Reasons, States},
+    answers::{Reasons, Retentions, States},
     classes::classes,
 };
 
@@ -62,7 +62,7 @@ pub fn check_segment(
     head: Value,
     counts: Value,
     state_name: Value,
-    pinned: Value,
+    retention: Value,
     replacement: Value,
 ) -> Result<(), Error> {
     let [id_value, revision, base_offset, records] =
@@ -89,7 +89,7 @@ pub fn check_segment(
         bytes,
         opened_at,
         States::parse(ruby, state_name)?,
-        boolean(pinned, "pinned")?,
+        Retentions::parse(ruby, retention)?,
         replacement.map(|handle| handle.replacement),
     )
     .map(drop)

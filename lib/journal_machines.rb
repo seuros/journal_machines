@@ -17,15 +17,16 @@ module JournalMachines
   # Integer nanoseconds on the monotonic clock the journal was given. Like the
   # core's `Segment::checked`, it holds only what some journal could answer:
   # anything else raises RangeError (TypeError for a wrong type: Integers,
-  # a state Symbol, true or false, a Replacement or nil).
+  # a state Symbol, a retention Symbol (:pinned or :unpinned), a Replacement
+  # or nil).
   Segment = Data.define(
     :id, :revision, :base_offset, :records, :stored_records, :live_records,
-    :bytes, :opened_at, :state, :pinned, :replacement
+    :bytes, :opened_at, :state, :retention, :replacement
   ) do
     def initialize(id:, revision:, base_offset:, records:, stored_records:, live_records:, bytes:, opened_at:,
-                   state:, pinned:, replacement:)
+                   state:, retention:, replacement:)
       Journal.__send__(:__check_segment, [id, revision, base_offset, records],
-                       [stored_records, live_records, bytes, opened_at], state, pinned, replacement)
+                       [stored_records, live_records, bytes, opened_at], state, retention, replacement)
       super
     end
 
@@ -70,7 +71,8 @@ require 'journal_machines_native/journal_machines_native'
 
 module JournalMachines
   # Pin and Replacement handles are values: two handles naming the same pin
-  # acquisition or replacement attempt are == and eql?, and hash alike.
+  # acquisition or replacement attempt are == and eql?, and hash alike. Only
+  # the journal builds them, and they are final like the values below.
 
   # The values are final. `initialize` is where each validates, and a subclass
   # could override it, or `allocate` build an instance that never ran it:
@@ -79,7 +81,7 @@ module JournalMachines
   # raises; `Marshal.load` and a hand-bound `Data#initialize` skip the check),
   # so the extension is the authority: the one value it reads back, a Policy,
   # must be exactly a Policy and is checked again by the core.
-  [Policy, Segment, Due, Rolled, Reclaimed].each do |value|
+  [Policy, Segment, Due, Rolled, Reclaimed, Pin, Replacement].each do |value|
     value.singleton_class.undef_method(:allocate)
     value.define_singleton_method(:inherited) { |_| raise TypeError, "#{value} cannot be subclassed" }
   end
@@ -126,23 +128,11 @@ module JournalMachines
     # (another scope, sequence zero, not reached) is no position: [].
 
     # Pin a checkpoint at a tracker's confirmed-committed base, under its
-    # assignment generation. Both come from the one tracker passed.
-    def pin_checkpoint_from(tracker) = pin_checkpoint(*checkpoint_source(tracker))
-
-    # Move a checkpoint pin to a tracker's confirmed-committed base.
-    def checkpoint_from(pin, tracker) = checkpoint(pin, *checkpoint_source(tracker))
+    # assignment generation, and move a checkpoint pin to one
+    # (#checkpoint_from(pin, tracker)): both are native. The tracker is a
+    # sibling gem's value, read by its public `generation` and `base` readers,
+    # each asked for before either runs; TypeError naming the reader it lacks.
 
     private :__policy
-
-    private
-
-    # Assignment generation and committed base of one offset tracker.
-    def checkpoint_source(tracker)
-      unless tracker.respond_to?(:generation) && tracker.respond_to?(:base)
-        raise TypeError, 'expected an offset tracker responding to #generation and #base'
-      end
-
-      [tracker.generation, tracker.base]
-    end
   end
 end

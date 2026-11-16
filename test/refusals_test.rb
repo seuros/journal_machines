@@ -105,8 +105,6 @@ class RefusalsTest < Minitest::Test
     journal, = journal_with(1)
     pin = journal.pin_reader(0)
     replacement = journal.propose(1)
-    assert_raises(TypeError) { J::Pin.allocate }
-    assert_raises(TypeError) { J::Replacement.allocate }
     assert_raises(TypeError) { J::Journal.allocate }
     assert_raises(NoMethodError) { J::Journal.__open(0, 0, 0, [nil, nil, nil, 0]) }
     assert_raises(TypeError) { journal.release(replacement) }

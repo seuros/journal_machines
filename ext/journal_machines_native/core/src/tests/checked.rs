@@ -66,7 +66,7 @@ fn a_segment_is_one_a_journal_answers() {
         },
         Segment { bytes: 1, ..active },
         Segment {
-            pinned: true,
+            retention: Retention::Pinned,
             ..active
         },
         Segment {
@@ -126,7 +126,7 @@ fn a_segment_is_one_a_journal_answers() {
         },
         Segment {
             state: SegmentState::Reclaimable,
-            pinned: true,
+            retention: Retention::Pinned,
             ..proposed
         },
     ];
@@ -144,7 +144,7 @@ fn a_segment_is_one_a_journal_answers() {
     assert!(
         Segment {
             state: SegmentState::Durable,
-            pinned: true,
+            retention: Retention::Pinned,
             ..proposed
         }
         .checked()

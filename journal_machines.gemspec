@@ -6,8 +6,10 @@ Gem::Specification.new do |spec|
   spec.version = JournalMachines::VERSION
   spec.authors = ['Abdelkader Boudih']
   spec.email = ['oss@seuros.com']
-  spec.summary = 'Initial native segment metadata policy: roll, compaction candidates, pin-gated reclaim'
-  spec.description = 'Local unstable segment metadata model, not a log writer, byte compactor or recovery runtime.'
+  spec.summary = 'Log segment metadata for Ruby: roll decisions, compaction candidates, pin-gated reclaim'
+  spec.description = 'Decides when to roll a log segment, which sealed segments are worth compacting, and when ' \
+                     'a replaced segment file may be deleted without losing what a reader or checkpoint pin ' \
+                     'still needs. Metadata only: not a log writer, byte compactor or recovery runtime.'
   spec.homepage = 'https://github.com/seuros/journal_machines'
   spec.license = 'MIT'
   spec.required_ruby_version = '>= 4.0.0'

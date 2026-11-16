@@ -4,6 +4,7 @@ module JournalMachines
   PIN_CAPACITY: Integer
   type roll_reason = :size | :records | :age
   type segment_state = :active | :sealed | :proposed | :durable | :reclaimable
+  type retention = :unpinned | :pinned
   # Integer nanoseconds on one monotonic clock, for instants and spans alike:
   # Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond). A non-Integer
   # raises TypeError; a value outside 0..2**64-1 raises RangeError.
@@ -79,7 +80,8 @@ module JournalMachines
   # some journal could answer these eleven values together (an issued id; an
   # active segment holding nothing; a closed one with records >= stored >=
   # live; a replacement exactly when proposed, durable or reclaimable;
-  # durable pinned, reclaimable not). TypeError for a wrong type.
+  # durable :pinned, reclaimable :unpinned, active :unpinned). TypeError for a
+  # wrong type.
   class Segment < Data
     attr_reader id: Integer
     attr_reader revision: Integer
@@ -90,13 +92,13 @@ module JournalMachines
     attr_reader bytes: Integer
     attr_reader opened_at: nanoseconds
     attr_reader state: segment_state
-    attr_reader pinned: bool
+    attr_reader retention: retention
     attr_reader replacement: Replacement?
     def self.new: (Integer id, Integer revision, Integer base_offset, Integer records, Integer stored_records,
-                   Integer live_records, Integer bytes, nanoseconds opened_at, segment_state state, bool pinned,
+                   Integer live_records, Integer bytes, nanoseconds opened_at, segment_state state, retention retention,
                    Replacement? replacement) -> Segment
                 | (id: Integer, revision: Integer, base_offset: Integer, records: Integer, stored_records: Integer,
-                   live_records: Integer, bytes: Integer, opened_at: nanoseconds, state: segment_state, pinned: bool,
+                   live_records: Integer, bytes: Integer, opened_at: nanoseconds, state: segment_state, retention: retention,
                    replacement: Replacement?) -> Segment
     def end_offset: () -> Integer
   end
@@ -183,8 +185,25 @@ module JournalMachines
     def reclaim: (Replacement) -> (Reclaimed | reclaim_refusal)
     def abort: (Replacement) -> (:aborted | abort_refusal)
 
+    # Private native hooks. `__open` is the one constructor `new`,
+    # `with_scope` and `resumed` reach (scope and issued as a pair, policy
+    # last); the `__check_*` hooks validate a Data value's fields at
+    # `initialize`, answering nil or raising.
+    private def self.__open: (Integer base_offset, nanoseconds now, [Integer, Integer] scope_and_issued, Policy policy) -> Journal
+    private def self.__check_policy: (Integer? max_bytes, Integer? max_records, nanoseconds? max_age,
+                                      Integer min_dead_per_mille) -> nil
+    private def self.__check_due: (roll_reason reason) -> nil
+    private def self.__check_rolled: (Integer sealed, Integer opened, Integer next_offset) -> nil
+    private def self.__check_reclaimed: (Integer segment, Integer revision, Integer bytes, Integer? replaced_by) -> nil
+    # Segment's id, revision, base_offset, records, then stored_records,
+    # live_records, bytes, opened_at.
+    private def self.__check_segment: ([Integer, Integer, Integer, Integer] head,
+                                       [Integer, Integer, Integer, nanoseconds] counts, segment_state state,
+                                       retention retention, Replacement? replacement) -> nil
+
     private
 
-    def checkpoint_source: (_Tracker tracker) -> [Integer, Integer]
+    # The Policy fields `policy` builds its value from, in order.
+    def __policy: () -> [Integer?, Integer?, nanoseconds?, Integer]
   end
 end

@@ -34,7 +34,9 @@ fn compare(real: &Real, model: &Model, rng: &mut Rng) {
     let after = SegmentId::from_raw(scoped(after_scope, sequence));
     let resumed = |views: Vec<Segment>| -> Vec<Segment> {
         let ours = after.scope() == model.scope && sequence != 0 && sequence <= model.issued;
-        let later = views.into_iter().filter(|view| ours && view.id > after);
+        let later = views
+            .into_iter()
+            .filter(|view| ours && view.id.raw() > after.raw());
         later.collect()
     };
     let candidates: Vec<Segment> = want
@@ -76,7 +78,7 @@ fn compare(real: &Real, model: &Model, rng: &mut Rng) {
         let holds = want
             .iter()
             .find(|view| view.state != SegmentState::Active && pin.offset < view.end_offset());
-        assert!(holds.is_none_or(|view| view.pinned));
+        assert!(holds.is_none_or(|view| view.retention == Retention::Pinned));
     }
 }
 

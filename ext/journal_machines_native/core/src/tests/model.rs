@@ -89,7 +89,11 @@ impl Model {
             bytes: segment.bytes,
             opened_at: at(segment.opened),
             state,
-            pinned,
+            retention: if pinned {
+                Retention::Pinned
+            } else {
+                Retention::Unpinned
+            },
             replacement: segment.attempt.map(|attempt| Replacement {
                 segment: SegmentId::from_raw(segment.id),
                 attempt,

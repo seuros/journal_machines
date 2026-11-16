@@ -1,6 +1,8 @@
 //! The binding's answers as the gem's own `Data` values, built from what the
 //! core returned with the classes resolved at init.
-use journal_machines::{Reclaimed, Refusal, RollReason, Rolled, Segment, SegmentState};
+use journal_machines::{
+    Reclaimed, Refusal, Retention, Roll, RollReason, Rolled, Segment, SegmentState,
+};
 use magnus::{Error, IntoValue, RClass, Ruby, Value, prelude::*};
 use matryona_machines::ruby::{SymbolNames, Symbols, nanoseconds};
 
@@ -38,6 +40,23 @@ matryona_machines::symbols! {
     }
 }
 
+matryona_machines::symbols! {
+    /// The core's retentions as Symbols.
+    pub Retentions for Retention as "retention" {
+        Unpinned => "unpinned",
+        Pinned => "pinned",
+    }
+}
+
+matryona_machines::symbols! {
+    /// The core's roll decisions by name: `Keep` answers its Symbol, `Due`
+    /// answers a `Due` value instead and its name is never sent.
+    pub Rolls for Roll as "roll decision" => names_only {
+        Keep => "keep",
+        Due(..) => "due",
+    }
+}
+
 pub fn rolled(class: RClass, rolled: Rolled) -> Result<Value, Error> {
     let fields = (
         rolled.sealed().raw(),
@@ -72,7 +91,7 @@ pub fn segment(ruby: &Ruby, class: RClass, segment: Segment) -> Result<Value, Er
         segment.bytes().into_value_with(ruby),
         nanoseconds(ruby, segment.opened_at()).as_value(),
         state.as_value(),
-        segment.pinned().into_value_with(ruby),
+        Retentions::symbol(ruby, segment.retention()).as_value(),
         replacement.into_value_with(ruby),
     ];
     class.funcall("new", fields)

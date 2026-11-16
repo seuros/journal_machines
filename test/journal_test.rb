@@ -193,7 +193,7 @@ class JournalTest < Minitest::Test
     first = journal.propose(1)
     second = journal.propose(2)
     [first, second].each { assert_equal :recorded, journal.confirm_superseded(it) }
-    assert_equal [:durable, true], journal.segment(1).to_h.values_at(:state, :pinned)
+    assert_equal %i[durable pinned], journal.segment(1).to_h.values_at(:state, :retention)
     assert_empty journal.reclaimable(nil, 64)
     assert_equal :pinned, journal.reclaim(first)
     assert_equal :moved, journal.advance(reader, 9)

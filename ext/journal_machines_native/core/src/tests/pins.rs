@@ -22,7 +22,10 @@ fn reclaim_waits_for_every_pin_of_either_kind() {
         Ok(Confirmed::Recorded)
     );
     let view = journal.segment(sealed[0]).expect("segment");
-    assert_eq!((view.state, view.pinned), (SegmentState::Durable, true));
+    assert_eq!(
+        (view.state, view.retention),
+        (SegmentState::Durable, Retention::Pinned)
+    );
     assert_eq!(journal.reclaimable(None).count(), 0);
     refuses(&mut journal, Refusal::Pinned { offset: 3 }, |j| {
         j.reclaim(replacement)
@@ -125,8 +128,8 @@ fn u64_limits_refuse_instead_of_wrapping() {
     let top = journal.pin_reader(u64::MAX).expect("pin");
     assert_eq!(journal.advance(top, u64::MAX), Ok(Advanced::Unchanged));
     assert_eq!(
-        journal.segment(rolled.sealed).map(|s| s.pinned),
-        Some(false)
+        journal.segment(rolled.sealed).map(|s| s.retention),
+        Some(Retention::Unpinned)
     );
 
     let huge = Small::new(policy(0, 0, 0, 1000), 0, at(0));

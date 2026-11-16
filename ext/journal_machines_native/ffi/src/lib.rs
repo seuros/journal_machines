@@ -18,8 +18,26 @@ use journal_machines::{
 };
 use magnus::{Error, Integer, IntoValue, RArray, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
 use matryona_machines::ruby::{
-    Symbols, duration, exact_array_n, exact_typed, integer, keep, nanoseconds, symbol,
+    Refused, SymbolNames, Symbols, class_name, duration, exact_array_n, exact_typed, integer, keep,
+    nanoseconds, sibling_why,
 };
+
+/// An offset tracker's assignment generation and committed base, in that
+/// order: a sibling gem's value (`OffsetMachines::Tracker`), read by its
+/// public `generation` and `base` readers. Both are asked for before either
+/// runs, so a tracker missing one runs none.
+fn tracker(ruby: &Ruby, value: Value) -> Result<[Value; 2], Error> {
+    sibling_why(ruby, value, ["generation", "base"], |why| match why {
+        Refused::MissingReader(reader) => format!(
+            "expected an offset tracker responding to #generation and #base, {} lacks #{reader}",
+            class_name(value)
+        ),
+        _ => format!(
+            "expected an offset tracker responding to #generation and #base, not {}",
+            class_name(value)
+        ),
+    })
+}
 
 /// The pin exactly a `Pin` handle names; `TypeError` for anything else, a
 /// subclass instance included.
@@ -136,7 +154,7 @@ impl Journal {
         let due = classes(ruby)?.due.get(ruby);
         let decision = this.core.borrow().roll_decision(bytes, records, now);
         reply(ruby, decision, |roll| match roll {
-            Roll::Keep => Ok(symbol(ruby, "keep").as_value()),
+            Roll::Keep => Ok(answers::Rolls::symbol_of(ruby, Roll::Keep).as_value()),
             Roll::Due(reason) => due.funcall("new", (answers::Reasons::symbol(ruby, reason),)),
         })
     }
@@ -273,6 +291,26 @@ impl Journal {
         let offset = integer(offset, "offset")?;
         let pin = this.core.borrow_mut().pin_checkpoint(assignment, offset);
         Self::pinned(ruby, pin)
+    }
+
+    /// `pin_checkpoint` at a tracker's committed base, under its generation,
+    /// both read from the one tracker before anything else is converted.
+    fn pin_checkpoint_from(ruby: &Ruby, this: Obj<Self>, source: Value) -> Result<Value, Error> {
+        this.check_frozen()?;
+        let [assignment, offset] = tracker(ruby, source)?;
+        Self::pin_checkpoint(ruby, this, assignment, offset)
+    }
+
+    /// `checkpoint` to a tracker's committed base, under its generation.
+    fn checkpoint_from(
+        ruby: &Ruby,
+        this: Obj<Self>,
+        handle: Value,
+        source: Value,
+    ) -> Result<Symbol, Error> {
+        this.check_frozen()?;
+        let [assignment, offset] = tracker(ruby, source)?;
+        Self::checkpoint(ruby, this, handle, assignment, offset)
     }
 
     fn advance(

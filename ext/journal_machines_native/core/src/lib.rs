@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(not(test), deny(clippy::indexing_slicing))]
 #![doc = include_str!("../README.md")]
 
 mod checked;
@@ -12,7 +13,7 @@ pub use pins::{Advanced, Checkpointed, Pin, PinKind};
 pub use policy::{Policy, RollReason};
 pub use refusal::Refusal;
 pub use replace::{Confirmed, Durable, Reclaimed, Replacement};
-pub use segment::{Roll, Rolled, Segment, SegmentState};
+pub use segment::{Retention, Roll, Rolled, Segment, SegmentState};
 
 use core::time::Duration;
 
@@ -26,7 +27,15 @@ use pins::PinSlot;
 /// from one sequence, so ids ascend but are not consecutive, and no pin
 /// generation or attempt of the same journal has the same raw value. A
 /// journal of another scope knows no segment by it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// It has no order: two ids of different journals compare by raw value
+/// without meaning anything, so ids are compared for equality only.
+///
+/// ```compile_fail
+/// use journal_machines::SegmentId;
+/// let _ = SegmentId::from_raw(1) < SegmentId::from_raw(2);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SegmentId(u64);
 
 impl SegmentId {
@@ -405,7 +414,11 @@ impl<const SEGMENTS: usize, const PINS: usize> Journal<SEGMENTS, PINS> {
             bytes: slot.bytes,
             opened_at: slot.opened_at,
             state,
-            pinned,
+            retention: if pinned {
+                Retention::Pinned
+            } else {
+                Retention::Unpinned
+            },
             replacement: attempt.map(|attempt| Replacement {
                 segment: id,
                 attempt,

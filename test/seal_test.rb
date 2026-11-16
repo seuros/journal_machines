@@ -30,6 +30,14 @@ class SealTest < Minitest::Test
     end
   end
 
+  # The native handles are final too: only the journal builds them.
+  def test_handles_cannot_be_subclassed_or_allocated
+    [J::Pin, J::Replacement].each do |handle|
+      assert_raises(TypeError, handle.name) { Class.new(handle) }
+      assert_raises(NoMethodError, handle.name) { handle.allocate }
+    end
+  end
+
   # A forged policy never reaches the core: not a leaked subclass, not one
   # whose fields `Marshal.load` rewrote.
   def test_a_forged_policy_is_refused
@@ -59,13 +67,8 @@ class SealTest < Minitest::Test
   # readers: a redefined reader is ignored.
   def test_a_redefined_reader_is_ignored
     policy = J::Policy.new(100, nil, nil, 250)
-    readers = %i[max_bytes min_dead_per_mille].to_h { [it, J::Policy.instance_method(it)] }
-    begin
-      J::Policy.define_method(:max_bytes) { 0 }
-      J::Policy.define_method(:min_dead_per_mille) { raise 'reader ran' }
-      journal = J::Journal.new(policy, 0, 0)
-    ensure
-      readers.each { |name, reader| J::Policy.define_method(name, reader) }
+    journal = redefining(J::Policy, max_bytes: proc { 0 }, min_dead_per_mille: proc { raise 'reader ran' }) do
+      J::Journal.new(policy, 0, 0)
     end
     assert_equal policy, journal.policy
   end
@@ -76,9 +79,9 @@ class SealTest < Minitest::Test
     list = Class.new(Array)
     head = [1, 0, 0, 0]
     counts = [0, 0, 0, 0]
-    assert_raises(TypeError) { J::Journal.__send__(:__check_segment, list[*head], counts, :active, false, nil) }
-    assert_raises(TypeError) { J::Journal.__send__(:__check_segment, head, list[*counts], :active, false, nil) }
-    assert_raises(TypeError) { J::Journal.__send__(:__check_segment, head, [0, 0, 0], :active, false, nil) }
+    assert_raises(TypeError) { J::Journal.__send__(:__check_segment, list[*head], counts, :active, :unpinned, nil) }
+    assert_raises(TypeError) { J::Journal.__send__(:__check_segment, head, list[*counts], :active, :unpinned, nil) }
+    assert_raises(TypeError) { J::Journal.__send__(:__check_segment, head, [0, 0, 0], :active, :unpinned, nil) }
     policy = J::Policy.new(nil, nil, nil, 500)
     assert_raises(TypeError) { J::Journal.__send__(:__open, 0, 0, list[0, 0], policy) }
     assert_raises(TypeError) { J::Journal.__send__(:__open, 0, 0, [0], policy) }
