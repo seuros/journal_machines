@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/seuros/journal_machines/compare/journal_machines/v0.7.1...journal_machines/v0.7.2) (2026-11-16)
+
+
+### Features
+
+* bounded replay window over a caller-stored log ([30c71d3](https://github.com/seuros/journal_machines/commit/30c71d3669ee40d755783422178b2de05144657f))
+
 ## [0.7.1](https://github.com/seuros/journal_machines/compare/journal_machines/v0.7.0...journal_machines/v0.7.1) (2026-11-16)
 
 
