@@ -152,6 +152,55 @@ fn a_segment_is_one_a_journal_answers() {
     );
 }
 
+/// Bug: a revision-0 segment storing fewer records than its range was
+/// accepted, though only a rewrite lowers the stored count and a rewrite
+/// always assigns a non-zero revision.
+#[test]
+fn a_segment_never_rewritten_stores_every_record() {
+    let segment = |revision, stored, live, state, replacement| {
+        Segment::new(
+            id(1),
+            revision,
+            0,
+            10,
+            stored,
+            live,
+            0,
+            Duration::ZERO,
+            state,
+            Retention::Unpinned,
+            replacement,
+        )
+    };
+    let original = Segment::new(
+        id(1),
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        Duration::ZERO,
+        SegmentState::Sealed,
+        Retention::Unpinned,
+        None,
+    );
+    assert_eq!(original, None);
+    assert_eq!(segment(0, 9, 9, SegmentState::Sealed, None), None);
+    let attempt = Replacement {
+        segment: id(1),
+        attempt: 7,
+    };
+    let proposed = segment(0, 4, 4, SegmentState::Proposed, Some(attempt));
+    assert_eq!(proposed, None);
+    // Never rewritten: stores its whole range, live records observed lower.
+    assert!(segment(0, 10, 3, SegmentState::Sealed, None).is_some());
+    // Rewritten: a non-zero revision stores what the rewrite kept, none too.
+    assert!(segment(5, 4, 4, SegmentState::Sealed, None).is_some());
+    assert!(segment(5, 0, 0, SegmentState::Sealed, None).is_some());
+    assert!(segment(5, 10, 10, SegmentState::Proposed, Some(attempt)).is_some());
+}
+
 #[test]
 fn a_cursor_is_an_identity_this_journal_issued() {
     let (mut journal, sealed) = journal_with(3);

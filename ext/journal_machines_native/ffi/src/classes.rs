@@ -3,6 +3,8 @@
 use magnus::{Error, RClass, RModule, Ruby};
 use matryona_machines::ruby::Class;
 
+use crate::{PinHandle, ReplacementHandle};
+
 /// The `Data` classes the binding builds and reads.
 pub struct Classes {
     pub policy: Class,
@@ -21,8 +23,9 @@ matryona_machines::registry! {
 }
 
 /// Resolves the classes `lib/journal_machines.rb` defined before it loaded the
-/// extension and pins the two handle classes init defined. Called once, from
-/// init; never by name again.
+/// extension and pins the two handle classes init defined, fixing magnus's
+/// class for each handle type to them: no handle conversion runs
+/// `Object.const_get` later. Called once, from init; never by name again.
 pub fn resolve(
     ruby: &Ruby,
     module: RModule,
@@ -36,8 +39,8 @@ pub fn resolve(
         due: class("Due")?,
         rolled: class("Rolled")?,
         reclaimed: class("Reclaimed")?,
-        pin: Class::pin(ruby, pin),
-        replacement: Class::pin(ruby, replacement),
+        pin: Class::pin_wrapped::<PinHandle>(ruby, pin)?,
+        replacement: Class::pin_wrapped::<ReplacementHandle>(ruby, replacement)?,
     };
     CLASSES.set(ruby, classes).map(drop)
 }

@@ -5,6 +5,7 @@ use magnus::{
     prelude::*,
     typed_data::{Hash, IsEql},
 };
+use matryona_machines::ruby::Class;
 
 /// `==`, `eql?` and `hash` by the identity a handle carries.
 macro_rules! value_object {
@@ -80,5 +81,6 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     class.define_method("reclaim", method!(Journal::reclaim, 1))?;
     class.define_method("abort", method!(Journal::abort, 1))?;
-    Ok(())
+    // `__open` answers a Journal: its class is fixed now, like the handles'.
+    Class::pin_wrapped::<Journal>(ruby, class).map(drop)
 }

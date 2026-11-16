@@ -56,6 +56,16 @@ class ValuesTest < Minitest::Test
     bad.each { |fields| assert_raises(RangeError, fields.inspect) { J::Segment.new(**fields) } }
   end
 
+  # Bug: a segment at revision 0 storing fewer records than its range was
+  # accepted, though only a rewrite, which assigns a revision, stores fewer.
+  def test_a_segment_never_rewritten_stores_every_record
+    plain = journal_with(1).first.segment(1)
+    assert_raises(RangeError) { J::Segment.new(1, 0, 0, 1, 0, 0, 0, 0, :sealed, :unpinned, nil) }
+    assert_raises(RangeError) { J::Segment.new(**plain.to_h, stored_records: 9, live_records: 9) }
+    rewritten = J::Segment.new(**plain.to_h, revision: 5, stored_records: 4, live_records: 4)
+    assert_equal [5, 4], [rewritten.revision, rewritten.stored_records]
+  end
+
   def test_a_segment_raises_type_error_for_a_wrong_type
     active = open_journal.active
     changes = [{ retention: nil }, { retention: true }, { state: 'active' }, { replacement: 5 }, { bytes: 1.0 },

@@ -32,7 +32,8 @@ record and byte counts, ids, revisions and generations are `u64`.
   records, stored_records, live_records, bytes, opened_at, state,
   retention, replacement)` answer `Some` only for a value some journal could have
   answered (issued ids of one scope, revisions and attempts drawn after their
-  segment, a segment whose counts, state, pin and replacement agree). Their
+  segment, a segment whose counts, state, pin and replacement agree, storing its
+  whole range at revision 0). Their
   fields are private: read them through the accessor of the same name, so no
   value skips the check.
 - `SegmentId`, `Pin` and `Replacement` are values: two handles to the same

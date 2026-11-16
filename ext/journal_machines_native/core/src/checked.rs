@@ -82,8 +82,9 @@ impl Segment {
     /// The id is issued and the revision is zero or an attempt drawn after
     /// it. An active segment holds nothing yet: no revision, records, stored
     /// or live records, bytes, pin (it is [`Retention::Unpinned`]) or replacement. A closed one holds at least
-    /// one record within `u64` offsets, stores no more than its range and has
-    /// no more live records than it stores. `Sealed` has no replacement; the
+    /// one record within `u64` offsets, stores no more than its range (all of
+    /// it at revision 0: only a rewrite, which assigns a revision, stores
+    /// fewer) and has no more live records than it stores. `Sealed` has no replacement; the
     /// other three have one on this segment, drawn after its revision.
     /// `Durable` is pinned, `Reclaimable` is not.
     // One argument per field, in the order the readers and Ruby name them.
@@ -129,9 +130,12 @@ impl Segment {
         };
         let replaced = self.replacement.is_some();
         let pinned = matches!(self.retention, Retention::Pinned);
+        // Only a rewrite stores fewer records than the range, and a rewrite
+        // assigns its attempt as the revision: revision 0 stores them all.
         let closed = self.records > 0
             && self.base_offset.checked_add(self.records).is_some()
             && self.stored_records <= self.records
+            && (self.revision != 0 || self.stored_records == self.records)
             && self.live_records <= self.stored_records;
         let state = match self.state {
             SegmentState::Active => {
