@@ -9,6 +9,7 @@ mod pins;
 mod random;
 mod refusals;
 mod repeats;
+mod replay;
 mod resume;
 mod scope;
 

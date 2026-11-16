@@ -7,12 +7,14 @@ mod pins;
 mod policy;
 mod refusal;
 mod replace;
+mod replay;
 mod segment;
 
 pub use pins::{Advanced, Checkpointed, Pin, PinKind};
 pub use policy::{Policy, RollReason};
 pub use refusal::Refusal;
 pub use replace::{Confirmed, Durable, Reclaimed, Replacement};
+pub use replay::{Appended, Coverage, ReplayWindow};
 pub use segment::{Retention, Roll, Rolled, Segment, SegmentState};
 
 use core::time::Duration;

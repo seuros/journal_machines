@@ -92,6 +92,27 @@ record and byte counts, ids, revisions and generations are `u64`.
   rewritten segment keeps its slot under a new revision; a superseded one
   leaves the journal.
 
+## Replay window
+
+`ReplayWindow<RECORDS>` is separate from the journal: the newest records of a
+log the caller stores, bounded by `RECORDS` and an optional byte budget, for
+replaying recent records to readers that fell behind. It keeps each retained
+record's size and nothing else; the caller keeps the records.
+
+- `ReplayWindow::new(max_bytes, base_offset)` starts empty; the first record
+  takes `base_offset`.
+- `append(bytes) -> Result<Appended, Refusal>` takes `next_offset()`, then
+  evicts the oldest records until at most `RECORDS` remain within the budget.
+  `Appended::floor` is the oldest offset still retained: delete everything
+  below it. A record over the budget leaves at once. Refuses `Overflow` when
+  the offset range is spent.
+- `coverage(cursor)` reads only: `Covered` when every record from the reader's
+  next wanted offset on is retained, `Behind { missed }` when records it never
+  saw were evicted, `Ahead` past `next_offset()`.
+- `restored(max_bytes, base_offset, next_offset, sizes)` rebuilds a stored
+  window from its retained sizes, oldest first, and refuses one no sequence of
+  appends leaves.
+
 ## Contract
 
 ### Scopes
