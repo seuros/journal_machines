@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "journal-machines"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "matryona-machines",
  "offset-machines",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "journal_machines_native"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "journal-machines",
  "magnus",
