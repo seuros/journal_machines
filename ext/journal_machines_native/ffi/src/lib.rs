@@ -10,11 +10,12 @@ use answers::reply;
 use classes::classes;
 use convert::{answer, policy, policy_from};
 use handles::{PinHandle, ReplacementHandle};
+use values::id;
 
 use std::{cell::RefCell, num::NonZeroU64};
 
 use journal_machines::{
-    Advanced, Checkpointed, Confirmed, Durable, Pin, Refusal, Replacement, Roll, Segment, SegmentId,
+    Advanced, Checkpointed, Confirmed, Durable, Pin, Refusal, Replacement, Roll, Segment,
 };
 use magnus::{Error, Integer, IntoValue, RArray, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
 use matryona_machines::ruby::{
@@ -53,11 +54,6 @@ fn replacement(ruby: &Ruby, value: Value) -> Result<Replacement, Error> {
     let class = classes(ruby)?.replacement.get(ruby);
     let message = "expected a JournalMachines::Replacement";
     exact_typed::<ReplacementHandle>(ruby, value, class, message).map(|handle| handle.replacement)
-}
-
-/// A segment id given as an Integer named `name`.
-fn id(value: Value, name: &str) -> Result<SegmentId, Error> {
-    integer(value, name).map(SegmentId::from_raw)
 }
 
 const SEGMENTS: usize = 64;

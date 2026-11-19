@@ -16,7 +16,8 @@ fn range(ruby: &Ruby, message: &'static str) -> Error {
     Error::new(ruby.exception_range_error(), message)
 }
 
-fn id(value: Value, name: &str) -> Result<SegmentId, Error> {
+/// A segment id given as an Integer named `name`.
+pub fn id(value: Value, name: &str) -> Result<SegmentId, Error> {
     integer(value, name).map(SegmentId::from_raw)
 }
 
